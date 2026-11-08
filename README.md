@@ -41,7 +41,14 @@ or reach the same effect another way; tell the user it was denied.
 ```
 
 and nothing runs. No answer within the wait (default five minutes) is a
-denial. So is anything the plugin cannot verify.
+denial. So is anything the plugin cannot verify. If you did answer and the
+platform refused the answer (a device proof it could not verify, say), the
+denial says so rather than reporting a timeout:
+
+```
+HumanAuth: an approval attempt was rejected at 2026-11-09T00:10:30Z (HTTP 401: Invalid device proof: …);
+nobody approved this Bash call within 300s (request req_01…). …
+```
 
 ## What needs approval
 
@@ -83,14 +90,28 @@ published keys:
    `biometric`), and, for a group, that the receipt carries the group's
    requirement so membership was checked.
 
-Only then does it return `allow`. Every outcome is appended to
-`audit.jsonl` in the plugin's data directory (`CLAUDE_PLUGIN_DATA`, which
-Claude Code puts under `~/.claude/plugins/data/humanauth-humanauth/` (plugin name, then marketplace name); the fallback
-outside Claude Code is `~/.humanauth/claude-plugin/`) with the request id,
-receipt id and plan hash. Each allow also keeps the receipt JWS and the
-plan it was checked against in `evidence/`, so anyone with the file and
-HumanAuth's public keys can re-verify the approval later without asking
-us. Both directories are protected paths.
+Only then does it return `allow`, and the receipt line above is handed to
+Claude as context next to the tool result (Claude Code only logs a hook's
+reason on allow), so the model can tell the user who approved what.
+
+Every gated call leaves two lines in `audit.jsonl` in the plugin's data
+directory (`CLAUDE_PLUGIN_DATA`, which Claude Code puts under
+`~/.claude/plugins/data/humanauth-humanauth/` (plugin name, then
+marketplace name); the fallback outside Claude Code is
+`~/.humanauth/claude-plugin/`): a `"decision": "pending"` line the moment
+the request exists on the platform, with the request id and plan hash, and
+the final `allow`, `deny` or `ask` line when the wait ends, with the
+receipt id and approvers. The file is therefore chronological even when a
+five-minute wait ends after later calls did, and a hook killed mid-wait
+still leaves the request id behind. A call refused before any request was
+created (an invalid tool input, a misconfiguration) writes the final line
+only. When the platform refused an answer during the wait, say a device
+proof it could not verify, the final line carries `respond_attempts`
+(`[{at, http_status, reason}]`) and the deny reason names the newest one,
+so a rejected approval never reads as "nobody answered". Each allow also
+keeps the receipt JWS and the plan it was checked against in `evidence/`,
+so anyone with the file and HumanAuth's public keys can re-verify the
+approval later without asking us. Both directories are protected paths.
 
 The hook is wired with `onFailure: block`: if it crashes, times out or
 prints something malformed, the call is refused. There is no path through
@@ -159,7 +180,7 @@ monorepo, where `@humanauth/verifier` is a workspace dependency. There:
 
 ```
 pnpm install
-npm test            # 142 tests: policy, plan, hook against a fake platform, the audit's probes, the built bundle end to end
+npm test            # 146 tests: policy, plan, hook against a fake platform, the audit's probes, the built bundle end to end
 npm run build       # regenerates scripts/phone-approval.mjs (committed)
 claude plugin validate --strict --profile directory .
 ```

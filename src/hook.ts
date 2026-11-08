@@ -78,7 +78,13 @@ export interface AuditEntry {
   matched?: string;
   plan_hash?: string;
   request_id?: string;
-  decision: "allow" | "deny" | "ask";
+  /**
+   * `pending` is written the moment the request exists on the platform, the
+   * final decision when the wait ends. Two lines per gated call keep the
+   * file chronological (a 300 s expiry is no longer logged after calls that
+   * finished earlier) and leave a trace if the hook dies mid-wait.
+   */
+  decision: "pending" | "allow" | "deny" | "ask";
   reason: string;
   receipt_id?: string;
   approvers?: string[];
@@ -304,6 +310,9 @@ export async function runHook(input: HookInput, cfg: HookConfig, deps: HookDeps)
     return fail(`could not reach ${cfg.platformUrl} (${(e as Error).message})`);
   }
   base.request_id = authorize.request_id;
+  // The request exists; say so now. The final line comes when the wait ends,
+  // so a crash or kill in between still leaves the request id on disk.
+  audit({ ...base, decision: "pending", reason: `awaiting approval from ${cfg.approver} for up to ${cfg.ttlSeconds}s` });
 
   // The receipt's `aud` is the tenant id; the platform tells us ours on the
   // request it just created, over the same authenticated channel.

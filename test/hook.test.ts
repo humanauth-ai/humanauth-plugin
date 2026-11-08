@@ -64,9 +64,29 @@ describe("approved", () => {
     // Claude Code only logs the reason on allow; the model reads additionalContext.
     expect(r!.hookSpecificOutput.additionalContext).toBe(reason);
     expect(reason).toMatch(/^HumanAuth: approved by hu_alice \(biometric\) · receipt rct_test_\S+ · plan sha256:[0-9a-f]{16}… · request req_1$/);
-    expect(audit).toHaveLength(1);
-    expect(audit[0]).toMatchObject({ decision: "allow", tool: "Bash", action: "claude_code:bash", approvers: ["hu_alice"], request_id: "req_1" });
+    // Two lines per gated call: pending when the request exists, the decision when the wait ends.
+    expect(audit).toHaveLength(2);
+    expect(audit[0]).toMatchObject({ decision: "pending", tool: "Bash", action: "claude_code:bash", request_id: "req_1", call: i.tool_use_id });
     expect(audit[0]!.plan_hash).toBe(planHash(buildPlan(i)));
+    expect(audit[0]!.reason).toContain("awaiting approval from hu_alice");
+    expect(audit[1]).toMatchObject({ decision: "allow", tool: "Bash", action: "claude_code:bash", approvers: ["hu_alice"], request_id: "req_1", call: i.tool_use_id });
+    expect(audit[1]!.plan_hash).toBe(planHash(buildPlan(i)));
+    expect(Date.parse(audit[1]!.at)).toBeGreaterThanOrEqual(Date.parse(audit[0]!.at));
+  });
+
+  it("writes the pending line before the wait, so a call that never ends still leaves its request id", async () => {
+    platform.setOutcome({ kind: "pending" });
+    let polls = 0;
+    const neverEnds = new Promise<never>(() => {});
+    // Hang on the first poll after the tenant lookup; the pending line must already be on disk.
+    const hanging: typeof platform.fetch = async (url, init) => {
+      if (String(url).includes("/v1/requests/") && ++polls > 1) return neverEnds;
+      return platform.fetch(url, init);
+    };
+    void runHook(input(), cfg, { ...deps(), fetch: hanging });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(audit).toHaveLength(1);
+    expect(audit[0]).toMatchObject({ decision: "pending", request_id: "req_1", action: "claude_code:bash" });
   });
 
   it("sends the derived plan and caption, severity high, the configured TTL and approver", async () => {
@@ -100,7 +120,9 @@ describe("approved", () => {
     void _drop;
     const r = await runHook(input(), cfg, rest);
     expect(r?.hookSpecificOutput.permissionDecision).toBe("allow");
-    const line = JSON.parse(readFileSync(join(cfg.dataDir, "audit.jsonl"), "utf8").trim());
+    const lines = readFileSync(join(cfg.dataDir, "audit.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(lines.map((l) => l.decision)).toEqual(["pending", "allow"]);
+    const line = lines[1];
     expect(line.evidence).toMatch(/^evidence\/[0-9a-f]{32}\.json$/);
     const ev = JSON.parse(readFileSync(join(cfg.dataDir, line.evidence), "utf8"));
     expect(ev.receipt_jws).toMatch(/^eyJ/);
@@ -241,6 +263,8 @@ describe("denied, expired, unverifiable", () => {
     expect(r?.hookSpecificOutput.permissionDecision).toBe("deny");
     expect(r?.hookSpecificOutput.permissionDecisionReason).toContain("must be a string");
     expect(platform.recorded.authorizeBodies).toHaveLength(0);
+    // No request was created, so no pending line: one deny only.
+    expect(audit.map((e) => e.decision)).toEqual(["deny"]);
   });
 });
 

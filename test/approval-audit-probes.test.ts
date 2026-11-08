@@ -144,7 +144,7 @@ describe("P1 binding", () => {
     expect(decision(r)).toBe("allow");
     const sent = (platform.recorded.authorizeBodies[0] as Detail).plan;
     expect(sent).toEqual(buildPlan(i));
-    expect(audit[0]!.plan_hash).toBe(planHash(sent));
+    expect(audit.at(-1)!.plan_hash).toBe(planHash(sent));
   });
 
   it("CONTROL: a receipt the device signed over a different plan does not verify for this call (PLAN_HASH_MISMATCH)", async () => {
@@ -485,7 +485,8 @@ describe("P6 evidence", () => {
     const r = await runHook(input(), cfg, noSink);
     expect(decision(r)).toBe("allow");
     expect(captured).toMatch(/^eyJ/);
-    const line = JSON.parse(readFileSync(join(cfg.dataDir, "audit.jsonl"), "utf8").trim());
+    // Last line: the pending line precedes the decision since v0.1.4.
+    const line = JSON.parse(readFileSync(join(cfg.dataDir, "audit.jsonl"), "utf8").trim().split("\n").pop()!);
     expect(line).toMatchObject({ decision: "allow", request_id: "req_1" });
     expect(line.evidence).toMatch(/^evidence\//);
     const ev = JSON.parse(readFileSync(join(cfg.dataDir, line.evidence), "utf8"));
@@ -515,7 +516,7 @@ describe("P6 evidence", () => {
     const file = join(cfg.dataDir, "audit.jsonl");
     const mode = statSync(file).mode & 0o777;
     expect(mode).toBe(0o600); // readable and writable by the agent's uid
-    const tampered = JSON.parse(readFileSync(file, "utf8").trim());
+    const tampered = JSON.parse(readFileSync(file, "utf8").trim().split("\n").pop()!); // the decision line (a pending line precedes it)
     tampered.approvers = ["hu_mallory"];
     writeFileSync(file, JSON.stringify(tampered) + "\n");
     expect(JSON.parse(readFileSync(file, "utf8")).approvers).toEqual(["hu_mallory"]); // nothing detects this

@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { spawn } from "node:child_process";
 import { createServer, type Server } from "node:http";
-import { mkdtempSync, existsSync } from "node:fs";
+import { mkdtempSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -76,13 +76,18 @@ describe("scripts/phone-approval.mjs", () => {
 
   it("allows an approved call, verifying the receipt against the served JWKS", async () => {
     platform.setOutcome({ kind: "approve" });
+    const dataDir = mkdtempSync(join(tmpdir(), "humanauth-bundle-"));
     const r = await run(hookInput("git push origin main"), {
       HUMANAUTH_API_KEY: "k",
       HUMANAUTH_APPROVER: "hu_alice",
       HUMANAUTH_PLATFORM_URL: baseUrl,
-      CLAUDE_PLUGIN_DATA: mkdtempSync(join(tmpdir(), "humanauth-bundle-")),
+      CLAUDE_PLUGIN_DATA: dataDir,
     });
     expect(r.stderr).toBe("");
+    // audit.jsonl is chronological: pending when the request was created, then the decision.
+    const lines = readFileSync(join(dataDir, "audit.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(lines.map((l) => l.decision)).toEqual(["pending", "allow"]);
+    expect(lines[0].request_id).toBe(lines[1].request_id);
     expect(r.code).toBe(0);
     const out = JSON.parse(r.stdout);
     expect(out.hookSpecificOutput.hookEventName).toBe("PreToolUse");

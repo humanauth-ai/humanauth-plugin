@@ -2533,6 +2533,7 @@ async function runHook(input, cfg, deps) {
     return fail(`could not reach ${cfg.platformUrl} (${e.message})`);
   }
   base.request_id = authorize.request_id;
+  audit({ ...base, decision: "pending", reason: `awaiting approval from ${cfg.approver} for up to ${cfg.ttlSeconds}s` });
   let tenantId;
   try {
     const res = await deps.fetch(`${cfg.platformUrl}/v1/requests/${encodeURIComponent(authorize.request_id)}`, { headers });
