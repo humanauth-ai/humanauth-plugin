@@ -88,6 +88,12 @@ describe("scripts/phone-approval.mjs", () => {
     expect(out.hookSpecificOutput.hookEventName).toBe("PreToolUse");
     expect(out.hookSpecificOutput.permissionDecision).toBe("allow");
     expect(out.hookSpecificOutput.permissionDecisionReason).toContain("approved by hu_alice");
+    // The exact shape Claude Code receives on allow: the receipt line both as
+    // the (debug-logged) reason and as context the model reads.
+    expect(Object.keys(out)).toEqual(["hookSpecificOutput"]);
+    expect(Object.keys(out.hookSpecificOutput).sort()).toEqual(["additionalContext", "hookEventName", "permissionDecision", "permissionDecisionReason"]);
+    expect(out.hookSpecificOutput.additionalContext).toBe(out.hookSpecificOutput.permissionDecisionReason);
+    expect(out.hookSpecificOutput.additionalContext).toMatch(/^HumanAuth: approved by hu_alice \(biometric\) · receipt rct_test_\S+ · plan sha256:[0-9a-f]{16}… · request req_\d+$/);
   }, 20_000);
 
   it("denies a denied call", async () => {
@@ -100,6 +106,7 @@ describe("scripts/phone-approval.mjs", () => {
     });
     const out = JSON.parse(r.stdout);
     expect(out.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(out.hookSpecificOutput).not.toHaveProperty("additionalContext");
   }, 20_000);
 
   it("denies on malformed stdin rather than letting the call through", async () => {

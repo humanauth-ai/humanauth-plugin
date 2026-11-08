@@ -61,6 +61,9 @@ describe("approved", () => {
     expect(reason).toContain("approved by hu_alice (biometric)");
     expect(reason).toMatch(/receipt rct_test_/);
     expect(reason).toContain(planHash(buildPlan(i)).slice(0, 23));
+    // Claude Code only logs the reason on allow; the model reads additionalContext.
+    expect(r!.hookSpecificOutput.additionalContext).toBe(reason);
+    expect(reason).toMatch(/^HumanAuth: approved by hu_alice \(biometric\) · receipt rct_test_\S+ · plan sha256:[0-9a-f]{16}… · request req_1$/);
     expect(audit).toHaveLength(1);
     expect(audit[0]).toMatchObject({ decision: "allow", tool: "Bash", action: "claude_code:bash", approvers: ["hu_alice"], request_id: "req_1" });
     expect(audit[0]!.plan_hash).toBe(planHash(buildPlan(i)));
@@ -148,6 +151,11 @@ describe("denied, expired, unverifiable", () => {
     const r = await runHook(input(), cfg, deps());
     expect(r?.hookSpecificOutput.permissionDecision).toBe("deny");
     expect(r?.hookSpecificOutput.permissionDecisionReason).toMatch(/denied .*Do not retry/);
+    // Deny and ask output is unchanged: the reason already reaches the model / the user.
+    expect(r?.hookSpecificOutput).not.toHaveProperty("additionalContext");
+    const ask = await runHook(input(), { ...cfg, apiKey: undefined }, deps());
+    expect(ask?.hookSpecificOutput.permissionDecision).toBe("ask");
+    expect(ask?.hookSpecificOutput).not.toHaveProperty("additionalContext");
   });
 
   it("denies when the request expires", async () => {

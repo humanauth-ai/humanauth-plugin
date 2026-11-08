@@ -2433,7 +2433,14 @@ function persistEvidence(dataDir, jti, record) {
   }
 }
 function out(decision, reason) {
-  return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: decision, permissionDecisionReason: reason } };
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: decision,
+      permissionDecisionReason: reason,
+      ...decision === "allow" ? { additionalContext: reason } : {}
+    }
+  };
 }
 function defaultAudit(dataDir) {
   return (e) => {

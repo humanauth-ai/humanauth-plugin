@@ -58,6 +58,14 @@ export interface HookOutput {
     hookEventName: "PreToolUse";
     permissionDecision: "allow" | "deny" | "ask";
     permissionDecisionReason: string;
+    /**
+     * Text Claude Code adds to the model's context next to the tool result.
+     * On `allow`, permissionDecisionReason goes to the debug log only (the
+     * model saw "no permission decision reason" in the 2026-11-09 live
+     * test), so the receipt line travels here too. Absent on deny and ask,
+     * where the reason itself reaches the model or the user.
+     */
+    additionalContext?: string;
   };
 }
 
@@ -153,7 +161,14 @@ function persistEvidence(dataDir: string, jti: string, record: unknown): string 
 }
 
 function out(decision: HookOutput["hookSpecificOutput"]["permissionDecision"], reason: string): HookOutput {
-  return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: decision, permissionDecisionReason: reason } };
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: decision,
+      permissionDecisionReason: reason,
+      ...(decision === "allow" ? { additionalContext: reason } : {}),
+    },
+  };
 }
 
 function defaultAudit(dataDir: string): (e: AuditEntry) => void {
