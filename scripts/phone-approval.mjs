@@ -2464,7 +2464,8 @@ async function runHook(input, cfg, deps) {
   };
   const fail = (reason, extra = {}) => finish(cfg.onError, `${reason}${cfg.onError === "ask" ? " (falling back to the keyboard prompt)" : ""}`, extra);
   if (!cfg.apiKey || !cfg.approver) {
-    return fail("plugin is not configured. Set api_key and approver under /plugin \u2192 humanauth \u2192 Configure, or HUMANAUTH_API_KEY and HUMANAUTH_APPROVER in the environment");
+    const decision = unattended ? "deny" : "ask";
+    return finish(decision, `plugin is not configured${decision === "ask" ? ", falling back to the keyboard prompt" : ""}. Set api_key and approver under /plugin \u2192 humanauth \u2192 Configure, or HUMANAUTH_API_KEY and HUMANAUTH_APPROVER in the environment`);
   }
   if (!/^(hu|grp)_[A-Za-z0-9_-]{2,80}$/.test(cfg.approver)) {
     return fail(`approver "${cfg.approver}" is not a hu_\u2026 or grp_\u2026 id`);

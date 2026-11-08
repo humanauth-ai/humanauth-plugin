@@ -221,12 +221,21 @@ describe("errors and configuration", () => {
     expect(d?.hookSpecificOutput.permissionDecision).toBe("deny");
   });
 
-  it("denies with setup instructions when api key or approver is missing", async () => {
+  it("falls back to the keyboard prompt with setup instructions when api key or approver is missing", async () => {
     const r = await runHook(input(), { ...cfg, apiKey: undefined }, deps());
-    expect(r?.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(r?.hookSpecificOutput.permissionDecision).toBe("ask");
     expect(r?.hookSpecificOutput.permissionDecisionReason).toContain("not configured");
     const r2 = await runHook(input(), { ...cfg, approver: "alice" }, deps());
+    expect(r2?.hookSpecificOutput.permissionDecision).toBe("deny");
     expect(r2?.hookSpecificOutput.permissionDecisionReason).toContain("not a hu_");
+  });
+
+  it("still denies an unconfigured gated call under bypassPermissions and dontAsk", async () => {
+    for (const permission_mode of ["bypassPermissions", "dontAsk"]) {
+      const r = await runHook({ ...input(), permission_mode }, { ...cfg, apiKey: undefined }, deps());
+      expect(r?.hookSpecificOutput.permissionDecision).toBe("deny");
+      expect(r?.hookSpecificOutput.permissionDecisionReason).toContain("not configured");
+    }
   });
 
   it("reads plugin options first, HUMANAUTH_* second, and clamps the TTL", () => {

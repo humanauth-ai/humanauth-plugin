@@ -113,10 +113,10 @@ describe("scripts/phone-approval.mjs", () => {
     expect(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision).toBe("deny");
   });
 
-  it("denies when unconfigured", async () => {
+  it("falls back to the keyboard prompt when unconfigured", async () => {
     const r = await run(hookInput("git push"), { CLAUDE_PLUGIN_DATA: mkdtempSync(join(tmpdir(), "humanauth-bundle-")) });
     const out = JSON.parse(r.stdout);
-    expect(out.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(out.hookSpecificOutput.permissionDecision).toBe("ask");
     expect(out.hookSpecificOutput.permissionDecisionReason).toContain("not configured");
   });
 });

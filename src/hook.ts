@@ -203,7 +203,13 @@ export async function runHook(input: HookInput, cfg: HookConfig, deps: HookDeps)
     finish(cfg.onError, `${reason}${cfg.onError === "ask" ? " (falling back to the keyboard prompt)" : ""}`, extra);
 
   if (!cfg.apiKey || !cfg.approver) {
-    return fail("plugin is not configured. Set api_key and approver under /plugin → humanauth → Configure, or HUMANAUTH_API_KEY and HUMANAUTH_APPROVER in the environment");
+    // Freshly installed and never configured: hand the call back to the
+    // ordinary keyboard prompt rather than refusing everything consequential
+    // in every session. Headless `-p` runs treat `ask` as a deny, and the
+    // unattended modes above already forced `deny`, so nothing becomes
+    // fail-open where nobody is watching.
+    const decision = unattended ? "deny" : "ask";
+    return finish(decision, `plugin is not configured${decision === "ask" ? ", falling back to the keyboard prompt" : ""}. Set api_key and approver under /plugin → humanauth → Configure, or HUMANAUTH_API_KEY and HUMANAUTH_APPROVER in the environment`);
   }
   if (!/^(hu|grp)_[A-Za-z0-9_-]{2,80}$/.test(cfg.approver)) {
     return fail(`approver "${cfg.approver}" is not a hu_… or grp_… id`);

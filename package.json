@@ -1,6 +1,6 @@
 {
   "name": "@humanauth/claude-plugin",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "type": "module",
   "description": "Claude Code plugin: approve what Claude does when you're not watching. A PreToolUse hook sends consequential tool calls to your phone and lets them run only against a verified, action-bound HumanAuth receipt.",
