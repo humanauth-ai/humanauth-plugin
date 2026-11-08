@@ -1,0 +1,19 @@
+{
+  "description": "Sends consequential tool calls to your phone through HumanAuth and runs them only against a verified, action-bound receipt.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/phone-approval.mjs"],
+            "timeout": 3660,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ]
+  }
+}

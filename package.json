@@ -1,0 +1,26 @@
+{
+  "name": "@humanauth/claude-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Claude Code plugin: approve what Claude does when you're not watching. A PreToolUse hook sends consequential tool calls to your phone and lets them run only against a verified, action-bound HumanAuth receipt.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "check-bundle": "node build.mjs --check",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@humanauth/verifier": "workspace:*",
+    "canonicalize": "^2.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.27.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

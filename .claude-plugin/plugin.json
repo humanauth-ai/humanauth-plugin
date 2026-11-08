@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin.json",
+  "name": "humanauth",
+  "displayName": "HumanAuth: approve from your phone",
+  "version": "0.1.0",
+  "description": "Approve what Claude does when you're not watching. Consequential tool calls (pushes, deploys, deletes, outbound writes, edits to credentials and agent settings) pause until you approve them on your phone. The call runs only against a signed, action-bound HumanAuth receipt verified on your machine, so the approval proves the action, not a click. Works in headless claude -p runs, CI and Cowork where nobody is at the keyboard.",
+  "author": {
+    "name": "HumanAuth",
+    "url": "https://humanauth.ai"
+  },
+  "homepage": "https://github.com/humanauth-ai/humanauth-plugin#readme",
+  "repository": "https://github.com/humanauth-ai/humanauth-plugin",
+  "license": "MIT",
+  "keywords": [
+    "human-in-the-loop",
+    "hitl",
+    "human-approval",
+    "tool-approval",
+    "phone-approval",
+    "unattended",
+    "headless",
+    "agent-security",
+    "receipts",
+    "pretooluse"
+  ],
+  "icon": "./.claude-plugin/icon.png",
+  "documentationUrl": "https://github.com/humanauth-ai/humanauth-plugin#readme",
+  "supportUrl": "https://humanauth.ai/support",
+  "privacyPolicyUrl": "https://humanauth.ai/privacy",
+  "termsOfServiceUrl": "https://humanauth.ai/terms",
+  "userConfig": {
+    "api_key": {
+      "type": "string",
+      "title": "HumanAuth API key",
+      "description": "Agent API key from app.humanauth.ai → API keys. Used only to create approval requests and read their receipts.",
+      "sensitive": true,
+      "required": true
+    },
+    "approver": {
+      "type": "string",
+      "title": "Approver",
+      "description": "Who gets the phone prompt: your human id (hu_…) or a group id (grp_…) from the HumanAuth dashboard. Only this approver's signed decision is accepted.",
+      "required": true
+    },
+    "scope": {
+      "type": "string",
+      "title": "What needs approval",
+      "description": "destructive: pushes, publishes, deploys, recursive deletes, sudo, outbound HTTP writes, DB mutations, infra CLIs, mail, and any edit to credentials, CI or Claude's own settings. all: every tool call that is not read-only. off: disabled.",
+      "options": ["destructive", "all", "off"],
+      "default": "destructive"
+    },
+    "extra_pattern": {
+      "type": "string",
+      "title": "Extra pattern (regex)",
+      "description": "Also require approval when a shell command, file path or MCP tool input matches this JavaScript regular expression. Example: make\\s+release|billing",
+      "required": false
+    },
+    "ttl_seconds": {
+      "type": "number",
+      "title": "Wait for approval (seconds)",
+      "description": "How long Claude waits for your tap before the call is denied. 30 to 3600.",
+      "default": 300,
+      "min": 30,
+      "max": 3600
+    },
+    "on_error": {
+      "type": "string",
+      "title": "If HumanAuth is unreachable",
+      "description": "deny: refuse the call (recommended for unattended runs). ask: fall back to the normal Claude Code permission prompt. A denial or an unverifiable receipt is always a deny regardless of this setting.",
+      "options": ["deny", "ask"],
+      "default": "deny"
+    },
+    "platform_url": {
+      "type": "string",
+      "title": "Platform URL",
+      "description": "Change only for a self-hosted HumanAuth platform.",
+      "default": "https://api.humanauth.ai"
+    }
+  }
+}
