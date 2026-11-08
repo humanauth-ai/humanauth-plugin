@@ -85,7 +85,7 @@ published keys:
 
 Only then does it return `allow`. Every outcome is appended to
 `audit.jsonl` in the plugin's data directory (`CLAUDE_PLUGIN_DATA`, which
-Claude Code puts under `~/.claude/plugins/data/humanauth/`; the fallback
+Claude Code puts under `~/.claude/plugins/data/humanauth-humanauth/` (plugin name, then marketplace name); the fallback
 outside Claude Code is `~/.humanauth/claude-plugin/`) with the request id,
 receipt id and plan hash. Each allow also keeps the receipt JWS and the
 plan it was checked against in `evidence/`, so anyone with the file and
