@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin.json",
   "name": "humanauth",
   "displayName": "HumanAuth: approve from your phone",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Approve what Claude does when you're not watching. Consequential tool calls (pushes, deploys, deletes, outbound writes, edits to credentials and agent settings) pause until you approve them on your phone. The call runs only against a signed, action-bound HumanAuth receipt verified on your machine, so the approval proves the action, not a click. Works in headless claude -p runs, CI and Cowork where nobody is at the keyboard.",
   "author": {
     "name": "HumanAuth",
