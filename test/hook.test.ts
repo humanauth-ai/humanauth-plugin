@@ -171,6 +171,38 @@ describe("denied, expired, unverifiable", () => {
     const r = await runHook(input(), cfg, { ...deps(), now: () => (t += 60_000) });
     expect(r?.hookSpecificOutput.permissionDecision).toBe("deny");
     expect(r?.hookSpecificOutput.permissionDecisionReason).toContain("Not approved means denied");
+    expect(r?.hookSpecificOutput.permissionDecisionReason).not.toContain("rejected");
+    expect(audit.at(-1)).not.toHaveProperty("respond_attempts");
+  });
+
+  // Live test 2026-11-09: Touch ID approval, POST /v1/respond → 401, and five
+  // minutes later the hook said "nobody approved". The platform now reports
+  // refused answers on the request; the hook must repeat them.
+  it("names the rejected approval attempt when the request expires, instead of calling it a timeout", async () => {
+    const attempt = { at: "2026-11-09T00:10:30.000Z", http_status: 401, reason: "Invalid device proof: invalid device public key encoding" };
+    platform.setOutcome({ kind: "expire", respondAttempts: [attempt] });
+    const r = await runHook(input(), cfg, deps());
+    expect(r?.hookSpecificOutput.permissionDecision).toBe("deny");
+    const reason = r!.hookSpecificOutput.permissionDecisionReason;
+    expect(reason).toContain(
+      "an approval attempt was rejected at 2026-11-09T00:10:30.000Z (HTTP 401: Invalid device proof: invalid device public key encoding); nobody approved this Bash call within 300s",
+    );
+    expect(reason).toContain("rejected by the platform, not ignored");
+    // The audit line carries the attempts too.
+    expect(audit.at(-1)).toMatchObject({ decision: "deny", request_id: "req_1", respond_attempts: [attempt] });
+  });
+
+  it("surfaces the newest of several rejected attempts, with the count, when the wait runs out", async () => {
+    const older = { at: "2026-11-09T00:10:00.000Z", http_status: 401, reason: "Invalid device proof: signature does not verify" };
+    const newer = { at: "2026-11-09T00:12:00.000Z", http_status: 400, reason: "Device does not belong to the specified human" };
+    platform.setOutcome({ kind: "pending", respondAttempts: [newer, older] }); // order from the platform is not relied on
+    let t = 0;
+    const r = await runHook(input(), cfg, { ...deps(), now: () => (t += 60_000) });
+    expect(r?.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(r?.hookSpecificOutput.permissionDecisionReason).toContain(
+      "2 approval attempts were rejected, the latest at 2026-11-09T00:12:00.000Z (HTTP 400: Device does not belong to the specified human); nobody approved this Bash call within 300s",
+    );
+    expect(audit.at(-1)!.respond_attempts).toEqual([newer, older]);
   });
 
   it("denies a receipt signed over a different plan (the call changed after the tap)", async () => {

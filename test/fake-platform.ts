@@ -23,10 +23,17 @@ export type Outcome =
       approval?: { threshold: number; required_principals?: string[] };
     }
   | { kind: "deny" }
-  | { kind: "expire" }
-  | { kind: "pending" }
+  /** `respondAttempts`: 4xx answers the platform refused on this request, served as `respond_attempts` (migration 0029). */
+  | { kind: "expire"; respondAttempts?: RespondAttempt[] }
+  | { kind: "pending"; respondAttempts?: RespondAttempt[] }
   | { kind: "http_error"; status: number }
   | { kind: "network_error" };
+
+export interface RespondAttempt {
+  at: string;
+  http_status: number;
+  reason: string;
+}
 
 export interface Recorded {
   authorizeBodies: unknown[];
@@ -116,7 +123,10 @@ export async function createFakePlatform(opts: { baseUrl: string; tenantId?: str
       // Same shape as production GET /v1/requests/:id: the tenant is nested
       // (`tenant.tenant_id`), not a top-level `tenant_id` (that is the list
       // endpoint's shape; v0.1.1 read the wrong one and failed closed live).
-      const common = { request_id: m[1], tenant: { tenant_id: tenantId, name: "Fake tenant" }, tenant_name: "Fake tenant", action: req.action, target_type: "human", target_id: approver, ttl: req.ttl, plan: req.plan, decisions: [] };
+      // `respond_attempts` is always present in production (0029), empty when
+      // nobody's answer was refused.
+      const respond_attempts = ("respondAttempts" in outcome && outcome.respondAttempts) || [];
+      const common = { request_id: m[1], tenant: { tenant_id: tenantId, name: "Fake tenant" }, tenant_name: "Fake tenant", action: req.action, target_type: "human", target_id: approver, ttl: req.ttl, plan: req.plan, decisions: [], respond_attempts };
       // First poll is the tenant lookup: still pending. Later polls resolve.
       if (req.polls <= 1 || outcome.kind === "pending") return json(200, { ...common, status: "delivered" });
       if (outcome.kind === "deny") return json(200, { ...common, status: "decided", result: "denied", receipt_id: "rct_denied" });

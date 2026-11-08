@@ -84,6 +84,34 @@ export interface AuditEntry {
   approvers?: string[];
   /** Path, relative to the data dir, of the retained receipt and plan. */
   evidence?: string;
+  /** Answers the platform refused (4xx on POST /v1/respond) while this call waited, oldest first. */
+  respond_attempts?: RespondAttempt[];
+}
+
+/** One rejected answer, as GET /v1/requests/:id reports it. */
+export interface RespondAttempt {
+  at: string;
+  http_status: number;
+  reason: string;
+}
+
+function readRespondAttempts(v: unknown): RespondAttempt[] | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const out: RespondAttempt[] = [];
+  for (const a of v as Array<Record<string, unknown>>) {
+    if (!a || typeof a !== "object") continue;
+    if (typeof a.at !== "string" || typeof a.http_status !== "number" || typeof a.reason !== "string") continue;
+    out.push({ at: a.at, http_status: a.http_status, reason: a.reason.slice(0, 300) });
+  }
+  return out;
+}
+
+/** "an approval attempt was rejected at <time> (HTTP 401: …)", newest attempt, with a count when there were several. */
+function describeRejected(attempts: RespondAttempt[]): string | null {
+  if (attempts.length === 0) return null;
+  const newest = attempts.reduce((a, b) => (Date.parse(b.at) >= Date.parse(a.at) ? b : a));
+  const head = attempts.length === 1 ? "an approval attempt was rejected" : `${attempts.length} approval attempts were rejected, the latest`;
+  return `${head} at ${newest.at} (HTTP ${newest.http_status}: ${newest.reason})`;
 }
 
 const SCOPES: ReadonlySet<string> = new Set(["destructive", "all", "off"]);
@@ -210,8 +238,13 @@ export async function runHook(input: HookInput, cfg: HookConfig, deps: HookDeps)
     action: policy.action,
     matched: policy.matched,
   };
+  // Answers the platform refused while we waited (a 401 on the device proof,
+  // say), as GET /v1/requests/:id reports them. Without these a rejected
+  // approval is indistinguishable from nobody answering (live test
+  // 2026-11-09). Every outcome's audit line carries whatever was seen.
+  let rejected: RespondAttempt[] = [];
   const finish = (decision: HookOutput["hookSpecificOutput"]["permissionDecision"], reason: string, extra: Partial<AuditEntry> = {}): HookOutput => {
-    audit({ ...base, ...extra, decision, reason });
+    audit({ ...base, ...(rejected.length > 0 ? { respond_attempts: rejected } : {}), ...extra, decision, reason });
     return out(decision, `HumanAuth: ${reason}`);
   };
   const fail = (reason: string, extra: Partial<AuditEntry> = {}): HookOutput =>
@@ -309,7 +342,8 @@ export async function runHook(input: HookInput, cfg: HookConfig, deps: HookDeps)
     for (;;) {
       const res = await deps.fetch(url, { headers });
       if (!res.ok) throw new RequestPollError(`GET /v1/requests/${authorize.request_id} → HTTP ${res.status}`);
-      const body = (await res.json()) as { status?: string; result?: string; receipt_jws?: string | null };
+      const body = (await res.json()) as { status?: string; result?: string; receipt_jws?: string | null; respond_attempts?: unknown };
+      rejected = readRespondAttempts(body.respond_attempts) ?? rejected;
       if (body.status === "expired") throw new ApprovalExpiredError(`request ${authorize.request_id} expired`);
       if (body.status === "decided") {
         if (body.result === "denied") throw new ApprovalDeniedError(`request ${authorize.request_id} was denied`);
@@ -332,7 +366,12 @@ export async function runHook(input: HookInput, cfg: HookConfig, deps: HookDeps)
       return finish("deny", `the approver denied this ${input.tool_name} call (request ${authorize.request_id}). Do not retry it, split it up, or reach the same effect another way; tell the user it was denied.`);
     }
     if (e instanceof ApprovalExpiredError || e instanceof ApprovalTimeoutError) {
-      return finish("deny", `nobody approved this ${input.tool_name} call within ${cfg.ttlSeconds}s (request ${authorize.request_id}). Not approved means denied; do not retry on your own.`);
+      // A rejected answer must not read as a timeout: name it, newest first.
+      const rejectedLine = describeRejected(rejected);
+      return finish(
+        "deny",
+        `${rejectedLine ? `${rejectedLine}; ` : ""}nobody approved this ${input.tool_name} call within ${cfg.ttlSeconds}s (request ${authorize.request_id}). Not approved means denied; do not retry on your own.${rejectedLine ? " Tell the user their approval was rejected by the platform, not ignored." : ""}`,
+      );
     }
     if (e instanceof RequestPollError) {
       return fail(`could not poll the approval request (${e.message})`);

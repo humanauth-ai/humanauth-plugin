@@ -2368,6 +2368,22 @@ var FileReplayStore = class {
 
 // src/hook.ts
 var ASSURANCE_RANK2 = { tap: 0, biometric: 1, elevated: 2, hardware: 2 };
+function readRespondAttempts(v) {
+  if (!Array.isArray(v)) return void 0;
+  const out2 = [];
+  for (const a of v) {
+    if (!a || typeof a !== "object") continue;
+    if (typeof a.at !== "string" || typeof a.http_status !== "number" || typeof a.reason !== "string") continue;
+    out2.push({ at: a.at, http_status: a.http_status, reason: a.reason.slice(0, 300) });
+  }
+  return out2;
+}
+function describeRejected(attempts) {
+  if (attempts.length === 0) return null;
+  const newest = attempts.reduce((a, b) => Date.parse(b.at) >= Date.parse(a.at) ? b : a);
+  const head = attempts.length === 1 ? "an approval attempt was rejected" : `${attempts.length} approval attempts were rejected, the latest`;
+  return `${head} at ${newest.at} (HTTP ${newest.http_status}: ${newest.reason})`;
+}
 var SCOPES = /* @__PURE__ */ new Set(["destructive", "all", "off"]);
 var TTL_MIN = 30;
 var TTL_MAX = 3600;
@@ -2465,8 +2481,9 @@ async function runHook(input, cfg, deps) {
     action: policy.action,
     matched: policy.matched
   };
+  let rejected = [];
   const finish = (decision, reason, extra = {}) => {
-    audit({ ...base, ...extra, decision, reason });
+    audit({ ...base, ...rejected.length > 0 ? { respond_attempts: rejected } : {}, ...extra, decision, reason });
     return out(decision, `HumanAuth: ${reason}`);
   };
   const fail = (reason, extra = {}) => finish(cfg.onError, `${reason}${cfg.onError === "ask" ? " (falling back to the keyboard prompt)" : ""}`, extra);
@@ -2545,6 +2562,7 @@ async function runHook(input, cfg, deps) {
       const res = await deps.fetch(url, { headers });
       if (!res.ok) throw new RequestPollError(`GET /v1/requests/${authorize.request_id} \u2192 HTTP ${res.status}`);
       const body = await res.json();
+      rejected = readRespondAttempts(body.respond_attempts) ?? rejected;
       if (body.status === "expired") throw new ApprovalExpiredError(`request ${authorize.request_id} expired`);
       if (body.status === "decided") {
         if (body.result === "denied") throw new ApprovalDeniedError(`request ${authorize.request_id} was denied`);
@@ -2568,7 +2586,11 @@ async function runHook(input, cfg, deps) {
       return finish("deny", `the approver denied this ${input.tool_name} call (request ${authorize.request_id}). Do not retry it, split it up, or reach the same effect another way; tell the user it was denied.`);
     }
     if (e instanceof ApprovalExpiredError || e instanceof ApprovalTimeoutError) {
-      return finish("deny", `nobody approved this ${input.tool_name} call within ${cfg.ttlSeconds}s (request ${authorize.request_id}). Not approved means denied; do not retry on your own.`);
+      const rejectedLine = describeRejected(rejected);
+      return finish(
+        "deny",
+        `${rejectedLine ? `${rejectedLine}; ` : ""}nobody approved this ${input.tool_name} call within ${cfg.ttlSeconds}s (request ${authorize.request_id}). Not approved means denied; do not retry on your own.${rejectedLine ? " Tell the user their approval was rejected by the platform, not ignored." : ""}`
+      );
     }
     if (e instanceof RequestPollError) {
       return fail(`could not poll the approval request (${e.message})`);
