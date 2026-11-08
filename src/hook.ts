@@ -257,9 +257,12 @@ export async function runHook(input: HookInput, cfg: HookConfig, deps: HookDeps)
   try {
     const res = await deps.fetch(`${cfg.platformUrl}/v1/requests/${encodeURIComponent(authorize.request_id)}`, { headers });
     if (!res.ok) return fail(`could not read the approval request (HTTP ${res.status})`);
-    const detail = (await res.json()) as { tenant_id?: string };
-    if (typeof detail.tenant_id !== "string" || detail.tenant_id.length === 0) return fail("approval request carries no tenant_id");
-    tenantId = detail.tenant_id;
+    // GET /v1/requests/:id nests it as `tenant.tenant_id`; older platforms
+    // (and the list endpoint) put it at the top level.
+    const detail = (await res.json()) as { tenant?: { tenant_id?: string }; tenant_id?: string };
+    const found = detail.tenant?.tenant_id ?? detail.tenant_id;
+    if (typeof found !== "string" || found.length === 0) return fail("approval request carries no tenant_id");
+    tenantId = found;
   } catch (e) {
     return fail(`could not read the approval request (${(e as Error).message})`);
   }

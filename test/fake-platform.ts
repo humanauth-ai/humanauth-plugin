@@ -113,7 +113,10 @@ export async function createFakePlatform(opts: { baseUrl: string; tenantId?: str
       if (!req) return json(404, { error: { code: "not_found", message: "no such request" } });
       req.polls += 1;
       recorded.detailPolls += 1;
-      const common = { request_id: m[1], tenant_id: tenantId, action: req.action, target_type: "human", target_id: approver, ttl: req.ttl, plan: req.plan, decisions: [] };
+      // Same shape as production GET /v1/requests/:id: the tenant is nested
+      // (`tenant.tenant_id`), not a top-level `tenant_id` (that is the list
+      // endpoint's shape; v0.1.1 read the wrong one and failed closed live).
+      const common = { request_id: m[1], tenant: { tenant_id: tenantId, name: "Fake tenant" }, tenant_name: "Fake tenant", action: req.action, target_type: "human", target_id: approver, ttl: req.ttl, plan: req.plan, decisions: [] };
       // First poll is the tenant lookup: still pending. Later polls resolve.
       if (req.polls <= 1 || outcome.kind === "pending") return json(200, { ...common, status: "delivered" });
       if (outcome.kind === "deny") return json(200, { ...common, status: "decided", result: "denied", receipt_id: "rct_denied" });

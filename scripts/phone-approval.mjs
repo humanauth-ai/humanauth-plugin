@@ -2513,8 +2513,9 @@ async function runHook(input, cfg, deps) {
     const res = await deps.fetch(`${cfg.platformUrl}/v1/requests/${encodeURIComponent(authorize.request_id)}`, { headers });
     if (!res.ok) return fail(`could not read the approval request (HTTP ${res.status})`);
     const detail = await res.json();
-    if (typeof detail.tenant_id !== "string" || detail.tenant_id.length === 0) return fail("approval request carries no tenant_id");
-    tenantId = detail.tenant_id;
+    const found = detail.tenant?.tenant_id ?? detail.tenant_id;
+    if (typeof found !== "string" || found.length === 0) return fail("approval request carries no tenant_id");
+    tenantId = found;
   } catch (e) {
     return fail(`could not read the approval request (${e.message})`);
   }
