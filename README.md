@@ -133,15 +133,19 @@ the [privacy policy](https://humanauth.ai/privacy).
 
 ## Development
 
+This repository is published from `plugins/humanauth` in the HumanAuth
+monorepo, where `@humanauth/verifier` is a workspace dependency. There:
+
 ```
 pnpm install
 npm test            # 99 tests: policy, plan, hook against a fake platform, the built bundle end to end
-npm run build       # regenerates scripts/phone-approval.mjs (committed; CI checks it is fresh)
+npm run build       # regenerates scripts/phone-approval.mjs (committed)
 claude plugin validate --strict --profile directory .
 ```
 
 The hook ships as one bundled file so installing the plugin needs no
-`npm install`. Source is in `src/`; `@humanauth/verifier` does the receipt
-verification.
+`npm install`; this repo's CI runs the committed bundle on Node 20, 22 and
+24 with nothing installed. Source is in `src/`; `@humanauth/verifier` does
+the receipt verification. Issues and pull requests are welcome here.
 
 MIT licensed.
