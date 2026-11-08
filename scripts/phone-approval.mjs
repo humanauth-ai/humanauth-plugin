@@ -71,7 +71,8 @@ var require_canonicalize = __commonJS({
 });
 
 // src/hook.ts
-import { appendFileSync, mkdirSync as mkdirSync2 } from "node:fs";
+import { appendFileSync, mkdirSync as mkdirSync2, writeFileSync } from "node:fs";
+import { createHash as createHash4 } from "node:crypto";
 import { join as join2 } from "node:path";
 import { homedir } from "node:os";
 
@@ -2010,22 +2011,48 @@ var READ_ONLY_TOOLS = /* @__PURE__ */ new Set([
 ]);
 var EDIT_TOOLS = /* @__PURE__ */ new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 var PROTECTED_PATHS = [
-  { re: /(^|[\s/'"=:])\.claude(\/|$|[\s'"])/, label: "claude settings or hooks" },
-  { re: /(^|[\s/'"=])\.env(\.[A-Za-z0-9_.-]+)?($|[\s'"])/, label: "env file" },
-  { re: /(^|[\s/'"=])\.(ssh|aws|gnupg|kube|docker|config\/gh|npmrc|netrc|pypirc|git-credentials)(\/|$|[\s'"])/, label: "credentials" },
-  { re: /\.(pem|key|p12|pfx|jks|keystore)($|[\s'"])/, label: "key material" },
-  { re: /(^|[\s/'"=])\.git\/hooks(\/|$|[\s'"])/, label: "git hooks" },
-  { re: /(^|[\s/'"=])\.github\/workflows(\/|$|[\s'"])/, label: "CI workflow" },
-  { re: /(^|[\s/'"=])\.(gitlab-ci|circleci|buildkite|travis)/, label: "CI config" },
-  { re: /(^|[\s'"=])\/etc\//, label: "system config" },
-  { re: /Library\/LaunchAgents\//, label: "launch agent" },
-  { re: /(^|\/)(wrangler\.(toml|jsonc?)|vercel\.json|fly\.toml|netlify\.toml|serverless\.ya?ml|Procfile|app\.yaml|render\.yaml)($|[\s'"])/, label: "deploy manifest" },
-  { re: /\.(tf|tfvars)($|[\s'"])/, label: "terraform" },
-  { re: /(^|\/)(Dockerfile|docker-compose\.ya?ml|compose\.ya?ml)($|[\s'"])/, label: "container manifest" }
+  { re: /(^|[\s/'"=:])\.claude(\/|$|[\s'"])/i, label: "claude settings or hooks" },
+  { re: /(^|[\s/'"=:])\.humanauth(\/|$|[\s'"])/i, label: "humanauth plugin data" },
+  { re: /(^|[\s/'"=])\.env(\.[A-Za-z0-9_.-]+)?($|[\s'"])/i, label: "env file" },
+  { re: /(^|[\s/'"=])\.(ssh|aws|gnupg|kube|docker|config\/gh|npmrc|netrc|pypirc|git-credentials)(\/|$|[\s'"])/i, label: "credentials" },
+  { re: /\.(pem|key|p12|pfx|jks|keystore)($|[\s'"])/i, label: "key material" },
+  // Shell start-up files decide the environment of the next session, this hook's included.
+  { re: /(^|[\s/'"=])\.(zshrc|zshenv|zprofile|zlogin|zlogout|bashrc|bash_profile|bash_login|bash_logout|profile|login|cshrc|tcshrc|kshrc|mkshrc|inputrc|hushlogin|xonshrc)($|[\s'"])/i, label: "shell start-up file" },
+  { re: /(^|[\s/'"=])\.(config\/(fish|zsh|bash|nushell|sh|direnv)|zsh|oh-my-zsh|zprezto|zim|tmux\.conf|tmux)(\/|$|[\s'"])/i, label: "shell start-up file" },
+  { re: /(^|[\s/'"=])\.(envrc|direnvrc|tool-versions|nvmrc|node-version|mise\.toml)($|[\s'"])/i, label: "environment file" },
+  // Git config can alias a harmless command to a gated one.
+  { re: /(^|[\s/'"=])\.gitconfig($|[\s'"])/i, label: "git config" },
+  { re: /(^|[\s/'"=])\.git\/(config|hooks)(\/|$|[\s'"])/i, label: "git config or hooks" },
+  { re: /(^|[\s/'"=])\.github\/workflows(\/|$|[\s'"])/i, label: "CI workflow" },
+  { re: /(^|[\s/'"=])\.(gitlab-ci|circleci|buildkite|travis)/i, label: "CI config" },
+  { re: /(^|[\s'"=])\/etc\//i, label: "system config" },
+  { re: /Library\/(LaunchAgents|LaunchDaemons|Preferences)\//i, label: "launch agent or preferences" },
+  { re: /(^|\/)(wrangler\.(toml|jsonc?)|vercel\.json|fly\.toml|netlify\.toml|serverless\.ya?ml|Procfile|app\.yaml|render\.yaml)($|[\s'"])/i, label: "deploy manifest" },
+  { re: /\.(tf|tfvars)($|[\s'"])/i, label: "terraform" },
+  { re: /(^|\/)(Dockerfile|docker-compose\.ya?ml|compose\.ya?ml)($|[\s'"])/i, label: "container manifest" },
+  // Where interpreters live. The hook itself runs on `node` from PATH; a
+  // write here can replace it. Version managers and every `bin/` directory.
+  { re: /(^|[\s/'"=])\.(nvm|volta|fnm|asdf|n|nodenv|nodebrew|bun|deno|cargo|rustup|pyenv|rbenv|local\/bin|local\/share\/mise|mise)(\/|$|[\s'"])/i, label: "interpreter or tool install" },
+  { re: /(^|[\s'"=])\/(usr\/local|usr|opt\/homebrew|opt\/local|home\/linuxbrew\/\.linuxbrew|snap|nix)?\/?s?bin\//i, label: "bin directory", pathsOnly: true },
+  { re: /(^|[\s'"=])\/(opt\/homebrew|usr\/local)\/(Cellar|opt|lib)\//i, label: "homebrew install", pathsOnly: true },
+  { re: /(^|[\s'"=])\/nix\/store\//i, label: "nix store", pathsOnly: true },
+  { re: /(^|\/)(node|nodejs|npx|npm|pnpm|yarn|bun|deno|sh|bash|zsh|dash|fish|python3?|perl|ruby|env|claude)(\.exe|\.cmd|\.bat)?$/i, label: "interpreter binary", pathsOnly: true }
+];
+var INTERPRETER_LOCATION = String.raw`(\/(usr\/local\/|usr\/|opt\/homebrew\/|opt\/local\/|home\/linuxbrew\/\.linuxbrew\/)?s?bin\/|\.(nvm|volta|fnm|asdf|nodenv|nodebrew|local\/bin|cargo\/bin|bun\/bin|deno\/bin|n\/bin)\/|\/(opt\/homebrew|usr\/local)\/(Cellar|opt|lib)\/|\/nix\/store\/)`;
+var WRITE_VERBS = String.raw`\b(cp|mv|install|ln|tee|rsync|chmod|chown|touch|dd|patch|sed\s+-i[^\s]*|perl\s+-[a-z]*i|curl\s+-[a-zA-Z]*o|wget\s+-O)\b`;
+var INTERPRETER_WRITE = [
+  { re: new RegExp(`${WRITE_VERBS}[^|;&]*${INTERPRETER_LOCATION}`, "i"), label: "write into an interpreter location" },
+  { re: new RegExp(`>>?\\s*['"]?\\S*${INTERPRETER_LOCATION}`, "i"), label: "redirect into an interpreter location" },
+  { re: /\b(cp|mv|install|ln|tee|chmod|chown|touch)\b[^|;&]*\/(node|nodejs|npx|npm|pnpm|yarn|bun|deno|sh|bash|zsh|python3?|perl|ruby|env|claude)(\.exe)?(\s|$|['"])/i, label: "write to an interpreter binary" },
+  { re: /\b(npm|pnpm|yarn|bun)\s+(i|install|add|rm|remove|uninstall|link|ci|up|upgrade)\b.*\s(-g|--global|-w\s+\S+@)/i, label: "global package change" },
+  { re: /\b(corepack|nvm|volta|fnm|n|asdf|mise|nodenv)\s+(install|use|default|alias|pin|global|shell|exec|run|uninstall|set)\b/i, label: "node version change" }
 ];
 var DESTRUCTIVE_COMMANDS = [
-  { re: /\bgit\s+(push|reset\s+--hard|clean\s+-[a-z]*f|branch\s+-D|tag\s+-d|stash\s+(drop|clear)|remote\s+(set-url|remove|rm)|filter-branch|update-ref\s+-d|reflog\s+expire)/, label: "git history or remote change" },
-  { re: /\bgit\s+checkout\s+--\s/, label: "discard working changes" },
+  // `git -C dir push`, `git -c k=v push`, `git --git-dir=x push` all reach push.
+  { re: /\bgit(\s+-[Cc]\s+\S+|\s+--[a-z-]+(=\S+)?)*\s+(push|reset\s+--hard|clean\s+-[a-z]*f|branch\s+-D|tag\s+-d|stash\s+(drop|clear)|remote\s+(set-url|remove|rm|add)|filter-branch|filter-repo|update-ref\s+-d|reflog\s+expire|replace|gc\s+--prune)\b/, label: "git history or remote change" },
+  { re: /\bgit(\s+-[Cc]\s+\S+|\s+--[a-z-]+(=\S+)?)*\s+checkout\s+--\s/, label: "discard working changes" },
+  // Git config writes can alias `status` to `push`, set hooksPath, or change credential helpers.
+  { re: /\bgit(\s+-[Cc]\s+\S+|\s+--[a-z-]+(=\S+)?)*\s+config\b(?![^|;&]*(\s--get\b|\s--get-all\b|\s--get-regexp\b|\s--list\b|\s-l\b|\s--show-origin\b))[^|;&]*\S\s+\S/, label: "git config write" },
   { re: /(^|[\s;&|(])rm\s+(-[a-zA-Z]*[rRf][a-zA-Z]*\s|--recursive|--force)/, label: "recursive or forced delete" },
   { re: /(^|[\s;&|(])(rmdir|shred|srm)\s/, label: "delete" },
   { re: /(^|[\s;&|(])(sudo|doas|su)\s/, label: "privilege escalation" },
@@ -2068,7 +2095,10 @@ var DESTRUCTIVE_COMMANDS = [
   { re: /\b(security\s+(add-generic-password|delete-generic-password|find-generic-password|find-internet-password|export|import|unlock-keychain)|keychain|secret-tool|pass\s+(insert|rm|edit)|op\s+(item|vault|read|inject)|vault\s+(kv\s+(put|delete)|write|delete)|aws\s+secretsmanager|gcloud\s+secrets|doppler|infisical|sops\s+(-d|--decrypt|-e|--encrypt))\b/, label: "secret store access" },
   { re: /\b(claude|codex|cursor|gemini|copilot|aider|opencode)\s+(plugin|mcp|config|settings|hooks|--dangerously|--permission-mode|-p\s)/, label: "agent configuration" }
 ];
-var MCP_WRITE_VERBS = /(^|_)(send|post|publish|create|delete|remove|update|write|merge|pay|transfer|deploy|execute|exec|run|apply|insert|drop|cancel|charge|refund|email|message|reply|comment|upload|invite|revoke|grant|purchase|order|submit|approve|reject|close|archive|move|rename|set|put|patch|edit|add|assign|trigger|dispatch|restart|stop|start|kill|destroy|reset|truncate|migrate|push|commit|release|tag|share|forward|schedule|book|buy|sell|swap|withdraw|deposit|mint|burn|sign)(_|$)/i;
+var MCP_WRITE_VERBS = /(^|_)(send|post|publish|create|delete|remove|update|write|merge|pay|transfer|deploy|execute|exec|run|apply|insert|drop|cancel|charge|refund|email|message|reply|comment|upload|invite|revoke|grant|purchase|order|submit|approve|reject|close|archive|move|rename|set|put|patch|edit|add|assign|trigger|dispatch|restart|stop|start|kill|destroy|reset|truncate|migrate|push|commit|release|tag|share|forward|schedule|book|buy|sell|swap|withdraw|deposit|mint|burn|sign|transition|resolve|notify|announce|broadcast|invoke|call|emit|toggle|enable|disable|activate|deactivate|lock|unlock|ban|kick|block|unblock|promote|demote|rotate|generate|provision|deprovision|register|unregister|subscribe|unsubscribe|accept|decline|complete|finish|fulfil|fulfill|ship|dispatch|allocate|reserve|release|escalate|override|force|bypass|wipe|purge|clear|flush|drain|terminate|suspend|resume|redeploy|rollback|scale|exec_sql|query_write)(_|$)/i;
+function snakeCase(name) {
+  return name.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2").replace(/[-.\s]+/g, "_").toLowerCase();
+}
 function actionFor(toolName) {
   if (toolName === "Bash") return "claude_code:bash";
   if (toolName === "Write") return "claude_code:write";
@@ -2102,9 +2132,18 @@ function evaluate(toolName, toolInput, cfg) {
   if (cfg.scope === "all") {
     return { gated: true, action, matched: "scope: all" };
   }
+  const pathDirs = (cfg.pathDirs ?? []).filter((d) => d.length > 1);
   if (toolName === "Bash") {
-    for (const { re, label } of PROTECTED_PATHS) {
-      if (re.test(subject)) return { gated: true, action, matched: `touches ${label}` };
+    for (const { re, label, pathsOnly } of PROTECTED_PATHS) {
+      if (!pathsOnly && re.test(subject)) return { gated: true, action, matched: `touches ${label}` };
+    }
+    for (const { re, label } of INTERPRETER_WRITE) {
+      if (re.test(subject)) return { gated: true, action, matched: label };
+    }
+    if (pathDirs.length > 0 && new RegExp(WRITE_VERBS, "i").test(subject)) {
+      for (const d of pathDirs) {
+        if (subject.includes(d + "/") || subject.endsWith(d)) return { gated: true, action, matched: `writes into PATH directory ${d}` };
+      }
     }
     for (const { re, label } of DESTRUCTIVE_COMMANDS) {
       if (re.test(subject)) return { gated: true, action, matched: label };
@@ -2115,12 +2154,16 @@ function evaluate(toolName, toolInput, cfg) {
     for (const { re, label } of PROTECTED_PATHS) {
       if (re.test(subject)) return { gated: true, action, matched: `edits ${label}` };
     }
+    const dir = subject.replace(/\/[^/]*$/, "");
+    for (const d of pathDirs) {
+      if (dir === d || dir.toLowerCase() === d.toLowerCase()) return { gated: true, action, matched: `edits a file in PATH directory ${d}` };
+    }
     return { gated: false, action };
   }
   if (toolName.startsWith("mcp__")) {
     const parts = toolName.split("__");
     const tool = parts[parts.length - 1] ?? "";
-    if (MCP_WRITE_VERBS.test(tool)) return { gated: true, action, matched: `MCP tool "${tool}" writes` };
+    if (MCP_WRITE_VERBS.test(snakeCase(tool))) return { gated: true, action, matched: `MCP tool "${tool}" writes` };
     return { gated: false, action };
   }
   return { gated: false, action };
@@ -2150,6 +2193,8 @@ function optionalString(obj, key) {
   if (typeof v !== "string") throw new PlanError(`tool_input.${key} must be a string`);
   return v;
 }
+var TAIL_LIMIT = 300;
+var DECEPTIVE_CHARS = new RegExp("[\\u0000-\\u0008\\u000b-\\u001f\\u007f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2064\\u2066-\\u2069\\ufeff]");
 function textFields(plan, name, value) {
   if (value.length <= INLINE_LIMIT) {
     plan[name] = value;
@@ -2157,7 +2202,9 @@ function textFields(plan, name, value) {
     plan[`${name}_sha256`] = sha256(value);
     plan[`${name}_chars`] = value.length;
     plan[`${name}_preview`] = value.slice(0, PREVIEW_LIMIT);
+    plan[`${name}_tail`] = value.slice(-TAIL_LIMIT);
   }
+  if (DECEPTIVE_CHARS.test(value)) plan[`${name}_has_control_chars`] = true;
 }
 function buildPlan(input) {
   if (typeof input.session_id !== "string" || !ID.test(input.session_id)) {
@@ -2187,6 +2234,8 @@ function buildPlan(input) {
       if (command.trim().length === 0) throw new PlanError("tool_input.command is empty");
       textFields(plan, "command", command);
       if (obj.run_in_background === true) plan.background = true;
+      if (obj.dangerouslyDisableSandbox === true) plan.sandbox_disabled = true;
+      if (typeof obj.timeout === "number" && Number.isFinite(obj.timeout)) plan.timeout_ms = obj.timeout;
       break;
     }
     case "Write": {
@@ -2195,7 +2244,14 @@ function buildPlan(input) {
       plan.file_path = filePath;
       plan.bytes = Buffer.byteLength(content, "utf8");
       plan.content_sha256 = sha256(content);
-      plan.content_preview = content.slice(0, PREVIEW_LIMIT);
+      if (content.length <= INLINE_LIMIT) {
+        plan.content = content;
+      } else {
+        plan.content_chars = content.length;
+        plan.content_preview = content.slice(0, PREVIEW_LIMIT);
+        plan.content_tail = content.slice(-TAIL_LIMIT);
+      }
+      if (DECEPTIVE_CHARS.test(content)) plan.content_has_control_chars = true;
       break;
     }
     case "Edit": {
@@ -2233,7 +2289,10 @@ function planHash(plan) {
 }
 function describe(input, plan) {
   const where = typeof input.cwd === "string" && input.cwd ? ` in ${input.cwd.split("/").filter(Boolean).pop() ?? input.cwd}` : "";
-  const clip = (s, n = 140) => s.length > n ? s.slice(0, n - 1) + "\u2026" : s;
+  const clip = (s, n = 140) => {
+    const clean = s.replace(new RegExp(DECEPTIVE_CHARS.source, "g"), "\uFFFD");
+    return clean.length > n ? clean.slice(0, n - 1) + "\u2026" : clean;
+  };
   switch (input.tool_name) {
     case "Bash": {
       const cmd = typeof plan.command === "string" ? plan.command : String(plan.command_preview ?? "");
@@ -2308,6 +2367,7 @@ var FileReplayStore = class {
 };
 
 // src/hook.ts
+var ASSURANCE_RANK2 = { tap: 0, biometric: 1, elevated: 2, hardware: 2 };
 var SCOPES = /* @__PURE__ */ new Set(["destructive", "all", "off"]);
 var TTL_MIN = 30;
 var TTL_MAX = 3600;
@@ -2334,7 +2394,10 @@ function configFromEnv(env) {
   const ttlSeconds = Number.isFinite(ttlRaw) ? Math.min(TTL_MAX, Math.max(TTL_MIN, Math.floor(ttlRaw))) : 300;
   const platformUrl = (pick(env, "PLATFORM_URL") ?? "https://api.humanauth.ai").replace(/\/+$/, "");
   const onError = pick(env, "ON_ERROR") === "ask" ? "ask" : "deny";
+  const minRaw = pick(env, "MIN_ASSURANCE") ?? "biometric";
+  const minAssurance = minRaw in ASSURANCE_RANK2 && minRaw !== "hardware" ? minRaw : "biometric";
   const dataDir = env.CLAUDE_PLUGIN_DATA && env.CLAUDE_PLUGIN_DATA !== "" ? env.CLAUDE_PLUGIN_DATA : join2(homedir(), ".humanauth", "claude-plugin");
+  const pathDirs = (env.PATH ?? "").split(":").map((d) => d.trim().replace(/\/+$/, "")).filter((d) => d.startsWith("/"));
   return {
     apiKey: pick(env, "API_KEY"),
     approver: pick(env, "APPROVER"),
@@ -2344,8 +2407,30 @@ function configFromEnv(env) {
     platformUrl,
     issuer: pick(env, "ISSUER") ?? platformUrl,
     onError,
+    minAssurance,
+    allowInsecureUrl: env.HUMANAUTH_ALLOW_INSECURE_URL === "1",
+    pathDirs,
     dataDir
   };
+}
+function isLoopback(url) {
+  try {
+    const h = new URL(url).hostname;
+    return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1" || h.endsWith(".localhost");
+  } catch {
+    return false;
+  }
+}
+function persistEvidence(dataDir, jti, record) {
+  try {
+    const dir = join2(dataDir, "evidence");
+    mkdirSync2(dir, { recursive: true, mode: 448 });
+    const name = createHash4("sha256").update(jti).digest("hex").slice(0, 32) + ".json";
+    writeFileSync(join2(dir, name), JSON.stringify(record, null, 2) + "\n", { mode: 384, flag: "wx" });
+    return `evidence/${name}`;
+  } catch {
+    return void 0;
+  }
 }
 function out(decision, reason) {
   return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: decision, permissionDecisionReason: reason } };
@@ -2360,8 +2445,10 @@ function defaultAudit(dataDir) {
   };
 }
 async function runHook(input, cfg, deps) {
-  const policy = evaluate(input.tool_name, input.tool_input, { scope: cfg.scope, extraPattern: cfg.extraPattern });
+  const policy = evaluate(input.tool_name, input.tool_input, { scope: cfg.scope, extraPattern: cfg.extraPattern, pathDirs: cfg.pathDirs });
   if (!policy.gated) return null;
+  const unattended = input.permission_mode === "bypassPermissions" || input.permission_mode === "dontAsk";
+  if (unattended && cfg.onError === "ask") cfg = { ...cfg, onError: "deny" };
   const audit = deps.audit ?? defaultAudit(cfg.dataDir);
   const base = {
     at: (/* @__PURE__ */ new Date()).toISOString(),
@@ -2381,6 +2468,9 @@ async function runHook(input, cfg, deps) {
   }
   if (!/^(hu|grp)_[A-Za-z0-9_-]{2,80}$/.test(cfg.approver)) {
     return fail(`approver "${cfg.approver}" is not a hu_\u2026 or grp_\u2026 id`);
+  }
+  if (!cfg.platformUrl.startsWith("https://") && !(isLoopback(cfg.platformUrl) || cfg.allowInsecureUrl)) {
+    return fail(`platform_url ${cfg.platformUrl} is not https; receipts over plain http cannot be trusted`);
   }
   let plan;
   try {
@@ -2435,19 +2525,34 @@ async function runHook(input, cfg, deps) {
     replayStore: new FileReplayStore(cfg.dataDir)
   });
   let verified;
+  let receiptJws = "";
   try {
-    verified = await verifier.waitForReceipt(authorize.request_id, {
-      apiKey: cfg.apiKey,
+    const now = deps.now ?? (() => Date.now());
+    const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    const deadline = now() + cfg.ttlSeconds * 1e3 + 15e3;
+    let interval = deps.pollIntervalMs ?? 2e3;
+    const url = `${cfg.platformUrl}/v1/requests/${encodeURIComponent(authorize.request_id)}`;
+    for (; ; ) {
+      const res = await deps.fetch(url, { headers });
+      if (!res.ok) throw new RequestPollError(`GET /v1/requests/${authorize.request_id} \u2192 HTTP ${res.status}`);
+      const body = await res.json();
+      if (body.status === "expired") throw new ApprovalExpiredError(`request ${authorize.request_id} expired`);
+      if (body.status === "decided") {
+        if (body.result === "denied") throw new ApprovalDeniedError(`request ${authorize.request_id} was denied`);
+        if (typeof body.receipt_jws === "string" && body.receipt_jws.length > 0) {
+          receiptJws = body.receipt_jws;
+          break;
+        }
+      }
+      if (now() >= deadline) throw new ApprovalTimeoutError(`request ${authorize.request_id} still ${body.status ?? "pending"}`);
+      await sleep(Math.max(0, Math.min(interval, deadline - now())));
+      interval = Math.min(Math.floor(interval * 1.5), 15e3);
+    }
+    verified = await verifier.requireReceipt(receiptJws, {
       action: policy.action,
       plan,
-      idempotencyKey: null,
+      idempotencyKey: null
       // one call, one receipt, one use
-      baseUrl: cfg.platformUrl,
-      timeoutMs: cfg.ttlSeconds * 1e3 + 15e3,
-      pollIntervalMs: deps.pollIntervalMs,
-      fetch: deps.fetch,
-      sleep: deps.sleep,
-      now: deps.now
     });
   } catch (e) {
     if (e instanceof ApprovalDeniedError) {
@@ -2455,6 +2560,9 @@ async function runHook(input, cfg, deps) {
     }
     if (e instanceof ApprovalExpiredError || e instanceof ApprovalTimeoutError) {
       return finish("deny", `nobody approved this ${input.tool_name} call within ${cfg.ttlSeconds}s (request ${authorize.request_id}). Not approved means denied; do not retry on your own.`);
+    }
+    if (e instanceof RequestPollError) {
+      return fail(`could not poll the approval request (${e.message})`);
     }
     if (e instanceof HumanAuthVerifierError) {
       return finish("deny", `the receipt for request ${authorize.request_id} did not verify (${e.code}: ${e.message}). The call is refused.`);
@@ -2474,14 +2582,42 @@ async function runHook(input, cfg, deps) {
       });
     }
   }
+  if (cfg.approver.startsWith("grp_")) {
+    const approval = verified.raw.ha.approval;
+    if (!approval || !Array.isArray(approval.required_principals) || approval.required_principals.length === 0) {
+      return finish("deny", `receipt ${verified.raw.jti} for group ${cfg.approver} names no required principals, so membership cannot be checked here`, {
+        receipt_id: verified.raw.jti,
+        approvers
+      });
+    }
+  }
+  const weak = verified.approvers.filter((a) => (ASSURANCE_RANK2[a.assurance] ?? -1) < ASSURANCE_RANK2[cfg.minAssurance]);
+  if (weak.length > 0) {
+    return finish(
+      "deny",
+      `receipt ${verified.raw.jti} was approved with "${weak.map((a) => a.assurance).join(", ")}" assurance; this plugin requires at least "${cfg.minAssurance}" (min_assurance)`,
+      { receipt_id: verified.raw.jti, approvers }
+    );
+  }
   if (verified.replay) {
     return finish("deny", `receipt ${verified.raw.jti} was already used`, { receipt_id: verified.raw.jti, approvers });
   }
+  const evidence = persistEvidence(cfg.dataDir, verified.raw.jti, {
+    verified_at: (/* @__PURE__ */ new Date()).toISOString(),
+    request_id: authorize.request_id,
+    receipt_id: verified.raw.jti,
+    action: policy.action,
+    plan,
+    plan_hash: hash,
+    receipt_jws: receiptJws,
+    jwks_uri: deps.jwks ? null : `${cfg.platformUrl}/.well-known/jwks.json`,
+    approvers: verified.approvers
+  });
   const who = verified.approvers.map((a) => `${a.huid} (${a.assurance})`).join(", ");
   return finish(
     "allow",
     `approved by ${who} \xB7 receipt ${verified.raw.jti} \xB7 plan ${hash.slice(0, 23)}\u2026 \xB7 request ${authorize.request_id}`,
-    { receipt_id: verified.raw.jti, approvers }
+    { receipt_id: verified.raw.jti, approvers, evidence }
   );
 }
 

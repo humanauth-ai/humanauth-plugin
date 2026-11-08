@@ -51,7 +51,7 @@ gated too.
 
 | `scope` | Gated |
 |---|---|
-| `destructive` (default) | Shell: `git push`, hard resets, `rm -r`/`rm -f`, `sudo`, HTTP writes (`curl -X POST`, `-d`), package publishes, deploys (wrangler, vercel, fly, kubectl, terraform, pulumi, gcloud, aws, az, helm, docker push), GitHub writes (`gh pr merge`, `gh api -X DELETE`), database mutations and migrations, outbound mail, file transfer and remote shells, system configuration, global package installs, process and disk operations, history tampering, secret-store access, agent configuration. Files: any Write or Edit to `.claude/`, `.env*`, `.ssh`, `.aws`, key material, git hooks, CI workflows, deploy manifests, terraform, Dockerfiles. MCP: any tool whose name reads as a write (`send_message`, `merge_pull_request`, `execute_sql`, …). |
+| `destructive` (default) | Shell: `git push`, hard resets, `git config` writes, `rm -r`/`rm -f`, `sudo`, HTTP writes (`curl -X POST`, `-d`), package publishes, deploys (wrangler, vercel, fly, kubectl, terraform, pulumi, gcloud, aws, az, helm, docker push), GitHub writes (`gh pr merge`, `gh api -X DELETE`), database mutations and migrations, outbound mail, file transfer and remote shells, system configuration, global package installs, writes into any `PATH` or `bin/` directory, process and disk operations, history tampering, secret-store access, agent configuration. Files: any Write or Edit to `.claude/`, `.env*`, shell start-up files, `.gitconfig`, `.ssh`, `.aws`, key material, git hooks, CI workflows, deploy manifests, terraform, Dockerfiles, interpreter locations. MCP: any tool whose name reads as a write (`send_message`, `chat_postMessage`, `mergePullRequest`, `execute_sql`, …). |
 | `all` | Every tool call except the read-only built-ins (Read, Glob, Grep, WebFetch, …). |
 | `off` | Nothing. |
 
@@ -79,9 +79,18 @@ published keys:
    time (a file-based single-use store in the plugin's data directory);
 5. that the approver's assurance meets what your tenant policy requires.
 
+6. that the approver's assurance also meets `min_assurance` (default
+   `biometric`), and, for a group, that the receipt carries the group's
+   requirement so membership was checked.
+
 Only then does it return `allow`. Every outcome is appended to
-`~/.claude/plugins/data/humanauth/audit.jsonl` with the request id, receipt
-id and plan hash, so you can reconcile what ran against the dashboard.
+`audit.jsonl` in the plugin's data directory (`CLAUDE_PLUGIN_DATA`, which
+Claude Code puts under `~/.claude/plugins/data/humanauth/`; the fallback
+outside Claude Code is `~/.humanauth/claude-plugin/`) with the request id,
+receipt id and plan hash. Each allow also keeps the receipt JWS and the
+plan it was checked against in `evidence/`, so anyone with the file and
+HumanAuth's public keys can re-verify the approval later without asking
+us. Both directories are protected paths.
 
 The hook is wired with `onFailure: block`: if it crashes, times out or
 prints something malformed, the call is refused. There is no path through
@@ -89,13 +98,22 @@ this gate that does not end in a verified receipt.
 
 We audited it with the vendor-neutral
 [`hitl:human-approval-audit`](https://github.com/humanauth-ai/hitl-skills)
-skill; the report is in [`reports/`](./reports).
+skill before shipping, blind, and published the report unedited:
+[`reports/2026-11-08-self-audit.md`](./reports/2026-11-08-self-audit.md).
+The gated path passed all six properties; the ungated path of the default
+scope did not, and every finding was fixed the same day. The probes it
+wrote are in the test suite.
 
 ## Limits worth knowing
 
-- **It gates tool calls, not intent.** A shell command the pattern list
-  misses runs without a prompt in `destructive` scope. Use `all` for
-  sessions where that matters, or add a pattern.
+- **`destructive` is a convenience, not a boundary.** It gates the
+  launcher, not what it launches: `bash deploy.sh`, `npm run deploy` or
+  `make release` run without a prompt, and so does any command the pattern
+  list misses. For unattended runs use scope `all`, where only read-only
+  built-ins skip the phone.
+- **The hook runs on `node` from `PATH`.** Hooks have no portable absolute
+  interpreter path, so writes into any `PATH` directory, every `bin/`,
+  version managers and interpreter binaries are gated to keep a shim out.
 - **One tap per call.** Agentic sessions that push or deploy repeatedly
   will prompt repeatedly. The bundled `humanauth-approvals` skill teaches
   Claude to batch consequential steps and keep gated commands short.
@@ -115,12 +133,15 @@ skill; the report is in [`reports/`](./reports).
 | `scope` | `HUMANAUTH_SCOPE` | `destructive` |
 | `extra_pattern` | `HUMANAUTH_EXTRA_PATTERN` | none |
 | `ttl_seconds` (30–3600) | `HUMANAUTH_TTL_SECONDS` | `300` |
+| `min_assurance` (`tap`, `biometric`, `elevated`) | `HUMANAUTH_MIN_ASSURANCE` | `biometric` |
 | `on_error` (`deny` or `ask`) | `HUMANAUTH_ON_ERROR` | `deny` |
-| `platform_url` | `HUMANAUTH_PLATFORM_URL` | `https://api.humanauth.ai` |
+| `platform_url` (https) | `HUMANAUTH_PLATFORM_URL` | `https://api.humanauth.ai` |
 
 `on_error` only applies when the platform cannot be reached or the plugin
 is misconfigured. A denial, a timeout or an unverifiable receipt is always
-a deny.
+a deny, and under `bypassPermissions` or `dontAsk`, where nobody can answer
+a prompt, `ask` is treated as `deny`. Plain `http` platform URLs are
+refused except on loopback.
 
 ## Data handling
 
@@ -138,7 +159,7 @@ monorepo, where `@humanauth/verifier` is a workspace dependency. There:
 
 ```
 pnpm install
-npm test            # 99 tests: policy, plan, hook against a fake platform, the built bundle end to end
+npm test            # 142 tests: policy, plan, hook against a fake platform, the audit's probes, the built bundle end to end
 npm run build       # regenerates scripts/phone-approval.mjs (committed)
 claude plugin validate --strict --profile directory .
 ```

@@ -33,6 +33,9 @@ beforeEach(async () => {
     ttlSeconds: 300,
     platformUrl: BASE,
     onError: "deny",
+    minAssurance: "biometric",
+    allowInsecureUrl: false,
+    pathDirs: [],
     dataDir: mkdtempSync(join(tmpdir(), "humanauth-hook-")),
   };
 });
@@ -76,10 +79,56 @@ describe("approved", () => {
     expect(JSON.stringify(body)).not.toContain("harmless");
   });
 
-  it("targets a group when the approver is a grp_ id and accepts any member the receipt names", async () => {
+  it("targets a group when the approver is a grp_ id and accepts a receipt that carries the group's requirement", async () => {
+    platform.setOutcome({ kind: "approve", approval: { threshold: 1, required_principals: ["hu_alice", "hu_bob"] } });
     const r = await runHook(input(), { ...cfg, approver: "grp_ops" }, deps());
     expect((platform.recorded.authorizeBodies[0] as Record<string, unknown>).group_id).toBe("grp_ops");
     expect(r?.hookSpecificOutput.permissionDecision).toBe("allow");
+  });
+
+  it("refuses a group receipt that names no required principals (membership unverifiable)", async () => {
+    const r = await runHook(input(), { ...cfg, approver: "grp_ops" }, deps());
+    expect(r?.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(r?.hookSpecificOutput.permissionDecisionReason).toContain("names no required principals");
+  });
+
+  it("keeps the receipt and the plan as evidence next to the audit line", async () => {
+    const { audit: _drop, ...rest } = deps();
+    void _drop;
+    const r = await runHook(input(), cfg, rest);
+    expect(r?.hookSpecificOutput.permissionDecision).toBe("allow");
+    const line = JSON.parse(readFileSync(join(cfg.dataDir, "audit.jsonl"), "utf8").trim());
+    expect(line.evidence).toMatch(/^evidence\/[0-9a-f]{32}\.json$/);
+    const ev = JSON.parse(readFileSync(join(cfg.dataDir, line.evidence), "utf8"));
+    expect(ev.receipt_jws).toMatch(/^eyJ/);
+    expect(ev.plan_hash).toBe(line.plan_hash);
+    expect(ev.plan.command).toBe("git push origin main");
+  });
+
+  it("refuses a receipt below the configured minimum assurance", async () => {
+    platform.setOutcome({ kind: "approve", assurance: "tap" });
+    const r = await runHook(input(), cfg, deps());
+    expect(r?.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(r?.hookSpecificOutput.permissionDecisionReason).toContain('requires at least "biometric"');
+    platform.setOutcome({ kind: "approve", assurance: "tap" });
+    const lax = await runHook(input(), { ...cfg, minAssurance: "tap" }, deps());
+    expect(lax?.hookSpecificOutput.permissionDecision).toBe("allow");
+  });
+
+  it("refuses a plain-http platform URL unless it is loopback or explicitly allowed", async () => {
+    const r = await runHook(input(), { ...cfg, platformUrl: "http://platform.local" }, deps());
+    expect(r?.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(r?.hookSpecificOutput.permissionDecisionReason).toContain("not https");
+    expect(configFromEnv({ HUMANAUTH_ALLOW_INSECURE_URL: "1" }).allowInsecureUrl).toBe(true);
+  });
+
+  it("downgrades on_error=ask to deny when nobody can answer (bypassPermissions, dontAsk)", async () => {
+    platform.setOutcome({ kind: "http_error", status: 503 });
+    const r = await runHook(input({ permission_mode: "bypassPermissions" }), { ...cfg, onError: "ask" }, deps());
+    expect(r?.hookSpecificOutput.permissionDecision).toBe("deny");
+    platform.setOutcome({ kind: "http_error", status: 503 });
+    const d = await runHook(input({ permission_mode: "dontAsk" }), { ...cfg, onError: "ask" }, deps());
+    expect(d?.hookSpecificOutput.permissionDecision).toBe("deny");
   });
 
   it("writes the default audit file when no audit sink is injected", async () => {

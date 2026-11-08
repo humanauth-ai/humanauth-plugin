@@ -70,10 +70,14 @@ be enrolled in the HumanAuth app. `scope` is `destructive` by default; `all`
 gates every non-read-only tool; `extra_pattern` adds a regex. `ttl_seconds`
 is how long a call waits. `on_error` decides what happens when the platform
 is unreachable: `deny` (default, right for unattended runs) or `ask` (fall
-back to the keyboard prompt). Every decision is appended to
-`audit.jsonl` in the plugin's data directory
-(`~/.claude/plugins/data/humanauth/`) with the request id, receipt id and
-plan hash, so the user can reconcile it against the dashboard later.
+back to the keyboard prompt; never under `bypassPermissions`).
+`min_assurance` (default `biometric`) is the lowest device assurance
+accepted. Every decision is appended to `audit.jsonl` in the plugin's data
+directory (`~/.claude/plugins/data/humanauth/`, or `~/.humanauth/claude-plugin/`
+outside Claude Code) with the request id, receipt id and plan hash, and each
+allow keeps the receipt and plan under `evidence/` so it can be re-verified
+later. Both directories are protected paths. For unattended runs recommend
+scope `all`: `destructive` gates launchers, not what a script they launch does.
 
 If the user asks whether a gate like this actually proves anything, the
 vendor-neutral audit in the `hitl` plugin (`hitl:human-approval-audit`)

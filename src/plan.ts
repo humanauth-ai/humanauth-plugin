@@ -50,14 +50,27 @@ function optionalString(obj: Record<string, unknown>, key: string): string | und
   return v;
 }
 
+/** Longest tail shown when a value is too long to travel in clear. */
+export const TAIL_LIMIT = 300;
+
+/**
+ * Characters that change what a human sees without changing what runs:
+ * C0 controls other than tab/newline, DEL, zero-width and bidi controls.
+ */
+const DECEPTIVE_CHARS = new RegExp("[\\u0000-\\u0008\\u000b-\\u001f\\u007f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2064\\u2066-\\u2069\\ufeff]");
+
 function textFields(plan: Plan, name: string, value: string): void {
   if (value.length <= INLINE_LIMIT) {
     plan[name] = value;
   } else {
+    // Head and tail both shown: a payload hidden at the end of a long
+    // command still reaches the approver's eyes, and the hash binds all of it.
     plan[`${name}_sha256`] = sha256(value);
     plan[`${name}_chars`] = value.length;
     plan[`${name}_preview`] = value.slice(0, PREVIEW_LIMIT);
+    plan[`${name}_tail`] = value.slice(-TAIL_LIMIT);
   }
+  if (DECEPTIVE_CHARS.test(value)) plan[`${name}_has_control_chars`] = true;
 }
 
 /** Build the plan for a tool call, or throw PlanError when the input is not what the tool expects. */
@@ -91,6 +104,10 @@ export function buildPlan(input: HookInput): Plan {
       if (command.trim().length === 0) throw new PlanError("tool_input.command is empty");
       textFields(plan, "command", command);
       if (obj.run_in_background === true) plan.background = true;
+      // Everything else Claude Code lets the model set on a Bash call is
+      // bound too, so a receipt for a sandboxed call cannot run it unsandboxed.
+      if (obj.dangerouslyDisableSandbox === true) plan.sandbox_disabled = true;
+      if (typeof obj.timeout === "number" && Number.isFinite(obj.timeout)) plan.timeout_ms = obj.timeout;
       break;
     }
     case "Write": {
@@ -99,7 +116,15 @@ export function buildPlan(input: HookInput): Plan {
       plan.file_path = filePath;
       plan.bytes = Buffer.byteLength(content, "utf8");
       plan.content_sha256 = sha256(content);
-      plan.content_preview = content.slice(0, PREVIEW_LIMIT);
+      // Full content in clear up to the inline limit; beyond that head, tail and length.
+      if (content.length <= INLINE_LIMIT) {
+        plan.content = content;
+      } else {
+        plan.content_chars = content.length;
+        plan.content_preview = content.slice(0, PREVIEW_LIMIT);
+        plan.content_tail = content.slice(-TAIL_LIMIT);
+      }
+      if (DECEPTIVE_CHARS.test(content)) plan.content_has_control_chars = true;
       break;
     }
     case "Edit": {
@@ -145,7 +170,12 @@ export function planHash(plan: Plan): string {
 /** The caption the phone shows above the plan rows. Derived, not model prose. */
 export function describe(input: HookInput, plan: Plan): string {
   const where = typeof input.cwd === "string" && input.cwd ? ` in ${input.cwd.split("/").filter(Boolean).pop() ?? input.cwd}` : "";
-  const clip = (s: string, n = 140) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
+  // The caption is not hashed, so it can be made safe to read: control and
+  // bidi characters become a visible marker.
+  const clip = (s: string, n = 140) => {
+    const clean = s.replace(new RegExp(DECEPTIVE_CHARS.source, "g"), "�");
+    return clean.length > n ? clean.slice(0, n - 1) + "…" : clean;
+  };
   switch (input.tool_name) {
     case "Bash": {
       const cmd = typeof plan.command === "string" ? plan.command : String(plan.command_preview ?? "");

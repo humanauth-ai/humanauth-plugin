@@ -13,7 +13,15 @@ import {
 import type { JWK } from "jose";
 
 export type Outcome =
-  | { kind: "approve"; approver?: string; planOverride?: unknown; jti?: string; requestIdOverride?: string }
+  | {
+      kind: "approve";
+      approver?: string;
+      planOverride?: unknown;
+      jti?: string;
+      requestIdOverride?: string;
+      assurance?: "tap" | "biometric" | "elevated";
+      approval?: { threshold: number; required_principals?: string[] };
+    }
   | { kind: "deny" }
   | { kind: "expire" }
   | { kind: "pending" }
@@ -34,7 +42,15 @@ export interface FakePlatform {
   setOutcome(o: Outcome): void;
   keys: { platform: PlatformKeys; device: DeviceKeys };
   /** Mint a receipt outside the request flow (for replay tests). */
-  mint(args: { plan: unknown; action: string; requestId: string; jti?: string; approver?: string }): Promise<string>;
+  mint(args: {
+    plan: unknown;
+    action: string;
+    requestId: string;
+    jti?: string;
+    approver?: string;
+    assurance?: "tap" | "biometric" | "elevated";
+    approval?: { threshold: number; required_principals?: string[] };
+  }): Promise<string>;
 }
 
 export async function createFakePlatform(opts: { baseUrl: string; tenantId?: string; approver?: string; issuer?: string }): Promise<FakePlatform> {
@@ -51,19 +67,20 @@ export async function createFakePlatform(opts: { baseUrl: string; tenantId?: str
   const requests = new Map<string, { action: string; plan: unknown; ttl: number; polls: number; jws?: string }>();
   const recorded: Recorded = { authorizeBodies: [], detailPolls: 0 };
 
-  const mint: FakePlatform["mint"] = async ({ plan, action, requestId, jti, approver: who }) =>
+  const mint: FakePlatform["mint"] = async ({ plan, action, requestId, jti, approver: who, assurance, approval }) =>
     mintTestReceipt({
       plan,
       action,
       audience: tenantId,
       subject: who ?? approver,
-      approvers: [{ huid: who ?? approver, device_id: "dev_1", assurance: "biometric" }],
+      approvers: [{ huid: who ?? approver, device_id: "dev_1", assurance: assurance ?? "biometric" }],
       platformKeys: platform,
       deviceKeys,
       requestId,
       jti,
       issuer,
       expiresInSeconds: 600,
+      approval,
     });
 
   const json = (status: number, body: unknown) =>
@@ -109,6 +126,8 @@ export async function createFakePlatform(opts: { baseUrl: string; tenantId?: str
             requestId: outcome.requestIdOverride ?? m[1]!,
             jti: outcome.jti,
             approver: outcome.approver,
+            assurance: outcome.assurance,
+            approval: outcome.approval,
           });
         }
         return json(200, { ...common, status: "decided", result: "approved", receipt_id: "rct_1", receipt_jws: req.jws });
