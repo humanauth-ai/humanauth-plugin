@@ -46,33 +46,26 @@ export interface PolicyDecision {
  * delegates does not slip through unexamined.
  */
 export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
-  "Read",
-  "Glob",
-  "Grep",
-  "LS",
-  "WebFetch",
-  "WebSearch",
-  "TodoRead",
-  "TodoWrite",
-  "NotebookRead",
-  "ListMcpResourcesTool",
-  "ReadMcpResourceTool",
-  "ReadMcpResourceDirTool",
-  "AskUserQuestion",
-  "ExitPlanMode",
-  "EnterPlanMode",
-  "TaskOutput",
-  "BashOutput",
-  "ToolSearch",
-  "Skill",
-  "ListAgents",
-  "ReadNotifications",
+  // Reading and searching
+  "Read", "Glob", "Grep", "LS", "WebFetch", "WebSearch", "NotebookRead",
+  "ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool",
+  "ToolSearch", "Skill", "ListAgents", "ReadNotifications", "FetchInboxMessage",
+  // The session's own bookkeeping: todo list, plan mode, background-task output,
+  // its own next wake-up, worktree switches. None of these leave the machine or
+  // change anything durable (QA 2026-11-09 R2/R3: gating TaskCreate/TaskUpdate
+  // made destructive scope unusable interactively).
+  "TodoRead", "TodoWrite", "TaskCreate", "TaskUpdate", "TaskGet", "TaskList",
+  "TaskOutput", "TaskStop", "BashOutput", "KillShell",
+  "AskUserQuestion", "ExitPlanMode", "EnterPlanMode", "EnterWorktree", "ExitWorktree",
+  "ScheduleWakeup",
+  // Spawning a subagent is not itself consequential: the subagent inherits this
+  // hook, so every tool call it makes is gated on its own merits (QA R1).
+  "Agent", "Task",
 ]);
 
 export const EDIT_TOOLS: ReadonlySet<string> = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 
 /** Spawning a subagent hands the work to a process this hook sees only call by call; the hand-off itself needs a tap. */
-const DELEGATION_TOOLS: ReadonlySet<string> = new Set(["Task", "Agent"]);
 
 /**
  * Paths whose change alters who controls the machine or the agent: the
@@ -720,6 +713,5 @@ export function evaluate(toolName: string, toolInput: unknown, cfg: PolicyConfig
     return { gated: false, action };
   }
 
-  if (DELEGATION_TOOLS.has(toolName)) return { gated: true, action, matched: "delegation" };
   return { gated: true, action, matched: `unknown tool "${toolName}"` };
 }

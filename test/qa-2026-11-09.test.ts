@@ -226,7 +226,7 @@ describe("T1-3 unknown tools are gated in scope destructive", () => {
     }
   });
   it("gates tools that send, schedule, publish, trigger or delegate, with the generic tool action", () => {
-    for (const t of ["SendMessage", "CronCreate", "CronDelete", "RemoteTrigger", "Workflow", "Artifact", "SendUserFile", "PushNotification", "Monitor", "KillShell", "SomeFutureTool"]) {
+    for (const t of ["SendMessage", "CronCreate", "CronDelete", "RemoteTrigger", "Workflow", "Artifact", "SendUserFile", "PushNotification", "Monitor", "SomeFutureTool"]) {
       const r = evaluate(t, { x: 1 }, d);
       expect(r.gated, t).toBe(true);
       expect(r.action, t).toBe("claude_code:tool");
@@ -234,12 +234,19 @@ describe("T1-3 unknown tools are gated in scope destructive", () => {
     }
     expect(evaluate("SomeFutureTool", {}, d).matched).toBe('unknown tool "SomeFutureTool"');
   });
-  it("gates Agent and Task unconditionally as delegation, even with an innocent prompt", () => {
+  it("leaves Agent and Task free: the subagent inherits this hook, so its own calls are gated (QA R1)", () => {
     for (const t of ["Agent", "Task"]) {
-      const r = evaluate(t, { prompt: "read the README and summarise it", subagent_type: "Explore" }, d);
-      expect(r.gated, t).toBe(true);
-      expect(r.matched, t).toBe("delegation");
-      expect(r.action, t).toBe("claude_code:tool");
+      const r = evaluate(t, { prompt: "git push origin main", subagent_type: "general-purpose" }, d);
+      expect(r.gated, t).toBe(false);
+    }
+  });
+
+  it("leaves the session's own bookkeeping tools free (QA R2/R3)", () => {
+    for (const t of ["TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "ScheduleWakeup", "EnterWorktree", "ExitWorktree", "FetchInboxMessage", "TaskStop", "KillShell"]) {
+      expect(evaluate(t, { any: "thing" }, d).gated, t).toBe(false);
+    }
+    for (const t of ["SendUserFile", "PushNotification", "CronCreate", "RemoteTrigger", "SendMessage", "Artifact", "Monitor"]) {
+      expect(evaluate(t, { any: "thing" }, d).gated, t).toBe(true);
     }
   });
 });

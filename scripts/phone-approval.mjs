@@ -2283,30 +2283,48 @@ function render(cmds) {
 
 // src/policy.ts
 var READ_ONLY_TOOLS = /* @__PURE__ */ new Set([
+  // Reading and searching
   "Read",
   "Glob",
   "Grep",
   "LS",
   "WebFetch",
   "WebSearch",
-  "TodoRead",
-  "TodoWrite",
   "NotebookRead",
   "ListMcpResourcesTool",
   "ReadMcpResourceTool",
   "ReadMcpResourceDirTool",
-  "AskUserQuestion",
-  "ExitPlanMode",
-  "EnterPlanMode",
-  "TaskOutput",
-  "BashOutput",
   "ToolSearch",
   "Skill",
   "ListAgents",
-  "ReadNotifications"
+  "ReadNotifications",
+  "FetchInboxMessage",
+  // The session's own bookkeeping: todo list, plan mode, background-task output,
+  // its own next wake-up, worktree switches. None of these leave the machine or
+  // change anything durable (QA 2026-11-09 R2/R3: gating TaskCreate/TaskUpdate
+  // made destructive scope unusable interactively).
+  "TodoRead",
+  "TodoWrite",
+  "TaskCreate",
+  "TaskUpdate",
+  "TaskGet",
+  "TaskList",
+  "TaskOutput",
+  "TaskStop",
+  "BashOutput",
+  "KillShell",
+  "AskUserQuestion",
+  "ExitPlanMode",
+  "EnterPlanMode",
+  "EnterWorktree",
+  "ExitWorktree",
+  "ScheduleWakeup",
+  // Spawning a subagent is not itself consequential: the subagent inherits this
+  // hook, so every tool call it makes is gated on its own merits (QA R1).
+  "Agent",
+  "Task"
 ]);
 var EDIT_TOOLS = /* @__PURE__ */ new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
-var DELEGATION_TOOLS = /* @__PURE__ */ new Set(["Task", "Agent"]);
 var PROTECTED_PATHS = [
   { re: /(^|[\s/'"=:])\.claude(\/|$|[\s'"])/i, label: "claude settings or hooks" },
   { re: /(^|[\s/'"=:])\.humanauth(\/|$|[\s'"])/i, label: "humanauth plugin data" },
@@ -3013,7 +3031,6 @@ function evaluate(toolName, toolInput, cfg) {
     if (inspected) return { gated: true, action, matched: `MCP tool "${tool}": ${inspected}` };
     return { gated: false, action };
   }
-  if (DELEGATION_TOOLS.has(toolName)) return { gated: true, action, matched: "delegation" };
   return { gated: true, action, matched: `unknown tool "${toolName}"` };
 }
 
