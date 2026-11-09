@@ -720,3 +720,22 @@ describe("T2-5 non-string subject is gated, then refused by the plan builder", (
     expect(w?.hookSpecificOutput.permissionDecision).toBe("deny");
   });
 });
+
+
+describe("L2-a a late approval is noticed within a few seconds", () => {
+  it("never waits more than POLL_PENDING_MAX_MS between polls while pending", async () => {
+    const { runHook, POLL_PENDING_MAX_MS } = await import("../src/hook.js");
+    expect(POLL_PENDING_MAX_MS).toBeLessThanOrEqual(3_000);
+    platform.setOutcome({ kind: "pending" });
+    const sleeps: number[] = [];
+    let clock = 0;
+    const r = await runHook(
+      { session_id: "s", tool_use_id: "t", tool_name: "Bash", tool_input: { command: "git push" }, cwd: "/tmp", hook_event_name: "PreToolUse" } as never,
+      { ...cfg, ttlSeconds: 60 },
+      { fetch: platform.fetch, jwks: platform.jwks, now: () => clock, sleep: async (ms: number) => { sleeps.push(ms); clock += ms; }, pollIntervalMs: 2_000, audit: () => {} },
+    );
+    expect(r?.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(sleeps.length).toBeGreaterThan(20);
+    expect(Math.max(...sleeps)).toBeLessThanOrEqual(POLL_PENDING_MAX_MS);
+  });
+});

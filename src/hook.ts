@@ -257,6 +257,11 @@ interface PollBody {
  * Decide one tool call. Returns null when the call is not gated (Claude Code
  * then applies its normal permission flow), otherwise an allow/deny/ask.
  */
+/** Ceiling between polls while the request is pending (ms). */
+export const POLL_PENDING_MAX_MS = 3_000;
+/** Ceiling between polls while GET /v1/requests/:id keeps failing (ms). */
+export const POLL_BACKOFF_MAX_MS = 15_000;
+
 export async function runHook(input: HookInput, cfg: HookConfig, deps: HookDeps): Promise<HookOutput | null> {
   const cwd = typeof input.cwd === "string" && input.cwd.length > 0 ? input.cwd : undefined;
   // What this session has written so far, so a script the model wrote and
@@ -452,7 +457,10 @@ export async function runHook(input: HookInput, cfg: HookConfig, deps: HookDeps)
         throw new ApprovalTimeoutError(`request ${authorize.request_id} still ${lastStatus ?? "pending"}`);
       }
       await sleep(Math.max(0, Math.min(interval, deadline - now())));
-      interval = Math.min(Math.floor(interval * 1.5), 15_000);
+      // While the request is simply pending, poll at most every few seconds
+      // so a tap is noticed promptly (QA L2-a: a 15 s ceiling made a late
+      // approval wait ~19 s). Only a failing platform backs off further.
+      interval = Math.min(Math.floor(interval * 1.5), consecutiveFailures > 0 ? POLL_BACKOFF_MAX_MS : POLL_PENDING_MAX_MS);
     }
     const verifier = new HumanAuthVerifier({
       audience: tenantId!,

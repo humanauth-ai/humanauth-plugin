@@ -3449,6 +3449,8 @@ function defaultAudit(dataDir) {
     }
   };
 }
+var POLL_PENDING_MAX_MS = 3e3;
+var POLL_BACKOFF_MAX_MS = 15e3;
 async function runHook(input, cfg, deps) {
   const cwd = typeof input.cwd === "string" && input.cwd.length > 0 ? input.cwd : void 0;
   let session;
@@ -3602,7 +3604,7 @@ async function runHook(input, cfg, deps) {
         throw new ApprovalTimeoutError(`request ${authorize.request_id} still ${lastStatus ?? "pending"}`);
       }
       await sleep(Math.max(0, Math.min(interval, deadline - now())));
-      interval = Math.min(Math.floor(interval * 1.5), 15e3);
+      interval = Math.min(Math.floor(interval * 1.5), consecutiveFailures > 0 ? POLL_BACKOFF_MAX_MS : POLL_PENDING_MAX_MS);
     }
     const verifier = new HumanAuthVerifier({
       audience: tenantId,
