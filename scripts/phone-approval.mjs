@@ -2483,7 +2483,7 @@ async function runHook(input, cfg, deps) {
   };
   let rejected = [];
   const finish = (decision, reason, extra = {}) => {
-    audit({ ...base, ...rejected.length > 0 ? { respond_attempts: rejected } : {}, ...extra, decision, reason });
+    audit({ ...base, at: (/* @__PURE__ */ new Date()).toISOString(), ...rejected.length > 0 ? { respond_attempts: rejected } : {}, ...extra, decision, reason });
     return out(decision, `HumanAuth: ${reason}`);
   };
   const fail = (reason, extra = {}) => finish(cfg.onError, `${reason}${cfg.onError === "ask" ? " (falling back to the keyboard prompt)" : ""}`, extra);
@@ -2533,7 +2533,7 @@ async function runHook(input, cfg, deps) {
     return fail(`could not reach ${cfg.platformUrl} (${e.message})`);
   }
   base.request_id = authorize.request_id;
-  audit({ ...base, decision: "pending", reason: `awaiting approval from ${cfg.approver} for up to ${cfg.ttlSeconds}s` });
+  audit({ ...base, at: (/* @__PURE__ */ new Date()).toISOString(), decision: "pending", reason: `awaiting approval from ${cfg.approver} for up to ${cfg.ttlSeconds}s` });
   let tenantId;
   try {
     const res = await deps.fetch(`${cfg.platformUrl}/v1/requests/${encodeURIComponent(authorize.request_id)}`, { headers });

@@ -250,7 +250,9 @@ export async function runHook(input: HookInput, cfg: HookConfig, deps: HookDeps)
   // 2026-11-09). Every outcome's audit line carries whatever was seen.
   let rejected: RespondAttempt[] = [];
   const finish = (decision: HookOutput["hookSpecificOutput"]["permissionDecision"], reason: string, extra: Partial<AuditEntry> = {}): HookOutput => {
-    audit({ ...base, ...(rejected.length > 0 ? { respond_attempts: rejected } : {}), ...extra, decision, reason });
+    // Each line carries the time it was written, so the allow/deny line is
+    // stamped at decision time, not copied from the pending line.
+    audit({ ...base, at: new Date().toISOString(), ...(rejected.length > 0 ? { respond_attempts: rejected } : {}), ...extra, decision, reason });
     return out(decision, `HumanAuth: ${reason}`);
   };
   const fail = (reason: string, extra: Partial<AuditEntry> = {}): HookOutput =>
@@ -312,7 +314,7 @@ export async function runHook(input: HookInput, cfg: HookConfig, deps: HookDeps)
   base.request_id = authorize.request_id;
   // The request exists; say so now. The final line comes when the wait ends,
   // so a crash or kill in between still leaves the request id on disk.
-  audit({ ...base, decision: "pending", reason: `awaiting approval from ${cfg.approver} for up to ${cfg.ttlSeconds}s` });
+  audit({ ...base, at: new Date().toISOString(), decision: "pending", reason: `awaiting approval from ${cfg.approver} for up to ${cfg.ttlSeconds}s` });
 
   // The receipt's `aud` is the tenant id; the platform tells us ours on the
   // request it just created, over the same authenticated channel.

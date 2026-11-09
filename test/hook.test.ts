@@ -71,7 +71,9 @@ describe("approved", () => {
     expect(audit[0]!.reason).toContain("awaiting approval from hu_alice");
     expect(audit[1]).toMatchObject({ decision: "allow", tool: "Bash", action: "claude_code:bash", approvers: ["hu_alice"], request_id: "req_1", call: i.tool_use_id });
     expect(audit[1]!.plan_hash).toBe(planHash(buildPlan(i)));
-    expect(Date.parse(audit[1]!.at)).toBeGreaterThanOrEqual(Date.parse(audit[0]!.at));
+    // The decision line is stamped when it is written, not copied from the pending line
+    // (the fake platform's polls take real time, so the two differ).
+    expect(Date.parse(audit[1]!.at)).toBeGreaterThan(Date.parse(audit[0]!.at));
   });
 
   it("writes the pending line before the wait, so a call that never ends still leaves its request id", async () => {
