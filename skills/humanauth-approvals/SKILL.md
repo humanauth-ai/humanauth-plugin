@@ -39,8 +39,13 @@ not at this keyboard, so the phone is the keyboard.
 3. **Continue with work that does not depend on it.** If nothing else can
    proceed, end your turn and say what is waiting on them.
 4. **Never change the policy to get through.** Editing
-   `~/.claude/settings.json`, the plugin's config, or `hooks.json` is itself
-   a gated action and the user will see the attempt on their phone.
+   `~/.claude/settings.json`, `CLAUDE.md`, the plugin's config, or
+   `hooks.json` is itself a gated action and the user will see the attempt
+   on their phone. So is dressing the command up: quoting tricks, a
+   variable that holds the command, `$(…)`, `eval`, `sh -c`, `xargs`, an
+   interpreter one-liner that spawns a process, an unknown `git`
+   subcommand, or writing the command into a script and running it. Each
+   is recognised and gated, and reads as evasion in the audit log.
 
 ## Rules for planning in a gated session
 
@@ -57,8 +62,18 @@ not at this keyboard, so the phone is the keyboard.
 - **Do not put the model's explanation in the command.** The approver sees
   the command and the working directory, never your prose. Make the command
   self-explanatory.
+- **Keep secrets out of commands.** Credential-looking text (URL
+  passwords, `Bearer` tokens, `TOKEN=`/`password=` values, `ghp_`,
+  `sk-`, `AKIA…` and similar) is masked as `•••` before the plan reaches
+  the phone, and the approval still binds the real command through a hash.
+  Prefer environment variables or files the user already has anyway: a
+  masked command is harder to approve at a glance.
 - **Read-only work is never gated.** Reading, searching, fetching, planning,
-  and ordinary source edits run as before.
+  and ordinary source edits run as before. Writing a script is an ordinary
+  edit; running it in the same session is gated, so expect a tap when you
+  execute a file you just wrote. Spawning a subagent (`Agent`/`Task`) and
+  any built-in tool outside the read-only allowlist are gated in scope
+  `destructive`.
 
 ## Helping the user configure it
 
@@ -67,8 +82,11 @@ Setup is `/plugin` → `humanauth` → Configure, or the environment variables
 API key comes from app.humanauth.ai → API keys; the approver is their
 `hu_…` id (or a `grp_…` group) from the same dashboard, and their phone must
 be enrolled in the HumanAuth app. `scope` is `destructive` by default; `all`
-gates every non-read-only tool; `extra_pattern` adds a regex. `ttl_seconds`
-is how long a call waits. `on_error` decides what happens when the platform
+gates every non-read-only tool; `extra_pattern` adds a regex (if it does
+not compile, every non-read-only call is refused with the compile error
+until it is fixed; tell the user to correct the pattern). `ttl_seconds`
+is how long a call waits; a platform hiccup during the wait is retried,
+not treated as a denial. `on_error` decides what happens when the platform
 is unreachable: `deny` (default, right for unattended runs) or `ask` (fall
 back to the keyboard prompt; never under `bypassPermissions`).
 `min_assurance` (default `biometric`) is the lowest device assurance
