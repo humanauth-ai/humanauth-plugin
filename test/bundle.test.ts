@@ -69,7 +69,8 @@ describe("scripts/phone-approval.mjs", () => {
   });
 
   it("stays silent for a call the policy does not gate", async () => {
-    const r = await run(hookInput("git status"), { HUMANAUTH_API_KEY: "k", HUMANAUTH_APPROVER: "hu_alice", HUMANAUTH_PLATFORM_URL: baseUrl });
+    // CLAUDE_PLUGIN_DATA is set so the session record lands in a temp dir, not the real fallback.
+    const r = await run(hookInput("git status"), { HUMANAUTH_API_KEY: "k", HUMANAUTH_APPROVER: "hu_alice", HUMANAUTH_PLATFORM_URL: baseUrl, CLAUDE_PLUGIN_DATA: mkdtempSync(join(tmpdir(), "humanauth-bundle-")) });
     expect(r.code).toBe(0);
     expect(r.stdout.trim()).toBe("");
   });

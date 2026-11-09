@@ -1,7 +1,7 @@
 // One PreToolUse decision: gate? → ask the phone → verify the receipt → allow.
 // Everything that is not a verified approval of this exact call is a deny.
 
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, writeFileSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -15,9 +15,10 @@ import {
   type VerifiedReceipt,
 } from "@humanauth/verifier";
 import type { JWK } from "jose";
-import { evaluate, type Scope, type PolicyDecision } from "./policy.js";
+import { evaluate, EDIT_TOOLS, type Scope, type PolicyDecision } from "./policy.js";
 import { buildPlan, describe, planHash, PlanError, type HookInput, type Plan } from "./plan.js";
 import { FileReplayStore } from "./store.js";
+import { loadSession, recordWritten, type SessionState } from "./session.js";
 
 export interface HookConfig {
   apiKey?: string;
@@ -205,6 +206,14 @@ function out(decision: HookOutput["hookSpecificOutput"]["permissionDecision"], r
   };
 }
 
+function mtimeOrNull(p: string): number | null {
+  try {
+    return statSync(p).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
 function defaultAudit(dataDir: string): (e: AuditEntry) => void {
   return (e) => {
     try {
@@ -227,7 +236,38 @@ interface AuthorizeResponse {
  * then applies its normal permission flow), otherwise an allow/deny/ask.
  */
 export async function runHook(input: HookInput, cfg: HookConfig, deps: HookDeps): Promise<HookOutput | null> {
-  const policy: PolicyDecision = evaluate(input.tool_name, input.tool_input, { scope: cfg.scope, extraPattern: cfg.extraPattern, pathDirs: cfg.pathDirs });
+  const cwd = typeof input.cwd === "string" && input.cwd.length > 0 ? input.cwd : undefined;
+  // What this session has written so far, so a script the model wrote and
+  // then runs is gated at the run. Recorded for every edit tool call, gated
+  // or not; the hook sees them all.
+  let session: SessionState | undefined;
+  if (cfg.scope !== "off" && typeof input.session_id === "string" && input.session_id.length > 0) {
+    try {
+      session = loadSession(cfg.dataDir, input.session_id);
+    } catch {
+      session = undefined;
+    }
+  }
+  const policy: PolicyDecision = evaluate(input.tool_name, input.tool_input, {
+    scope: cfg.scope,
+    extraPattern: cfg.extraPattern,
+    pathDirs: cfg.pathDirs,
+    cwd,
+    writtenPaths: session ? new Set(session.written) : undefined,
+    sessionStartMs: session?.started_at,
+    fs: { mtimeMs: (p) => mtimeOrNull(p) },
+  });
+  if (session && EDIT_TOOLS.has(input.tool_name)) {
+    const ti = (input.tool_input ?? {}) as Record<string, unknown>;
+    const fp = ti.file_path ?? ti.notebook_path;
+    if (typeof fp === "string" && fp.length > 0) {
+      try {
+        recordWritten(cfg.dataDir, session, fp, cwd);
+      } catch {
+        /* best effort */
+      }
+    }
+  }
   if (!policy.gated) return null;
 
   // Under bypassPermissions and dontAsk nobody answers an `ask`; Claude Code

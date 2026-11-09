@@ -97,7 +97,8 @@ describe("scope: destructive — edits", () => {
     }
   });
   it("leaves ordinary source files alone", () => {
-    for (const p of ["/repo/src/index.ts", "/repo/README.md", "/repo/package.json", "/repo/.claude-plugin/plugin.json", "/repo/env.ts", "/repo/docs/environment.md"]) {
+    // package.json left this list with T1-2 (its scripts run on install and lifecycle).
+    for (const p of ["/repo/src/index.ts", "/repo/README.md", "/repo/package-lock.json", "/repo/.claude-plugin/plugin.json", "/repo/env.ts", "/repo/docs/environment.md", "/repo/docs/CLAUDE.md.bak"]) {
       expect(evaluate("Write", { file_path: p, content: "x" }, destructive).gated, p).toBe(false);
     }
   });
@@ -152,7 +153,9 @@ describe("scope: off and operator pattern", () => {
     expect(evaluate("Write", { file_path: "/r/src/billing.ts", content: "" }, cfg).gated).toBe(true);
     expect(evaluate("mcp__db__query", { table: "billing" }, cfg).gated).toBe(true);
   });
-  it("non-string command is treated as empty subject, not a crash", () => {
-    expect(evaluate("Bash", { command: ["rm", "-rf"] }, destructive).gated).toBe(false);
+  it("non-string command is gated as unrecognised input, not a crash and not a free pass (T2-5)", () => {
+    const d = evaluate("Bash", { command: ["rm", "-rf"] }, destructive);
+    expect(d.gated).toBe(true);
+    expect(d.matched).toBe("unrecognised input");
   });
 });

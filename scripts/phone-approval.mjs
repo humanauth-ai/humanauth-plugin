@@ -71,9 +71,9 @@ var require_canonicalize = __commonJS({
 });
 
 // src/hook.ts
-import { appendFileSync, mkdirSync as mkdirSync2, writeFileSync } from "node:fs";
-import { createHash as createHash4 } from "node:crypto";
-import { join as join2 } from "node:path";
+import { appendFileSync, mkdirSync as mkdirSync3, writeFileSync as writeFileSync2, statSync as statSync3 } from "node:fs";
+import { createHash as createHash5 } from "node:crypto";
+import { join as join3 } from "node:path";
 import { homedir } from "node:os";
 
 // ../../node_modules/jose/dist/node/esm/runtime/base64url.js
@@ -1983,33 +1983,330 @@ function buildInlineKeyResolver(jwks) {
 }
 
 // src/policy.ts
+import { posix } from "node:path";
+
+// src/shell.ts
+var BENIGN_VARS = /^\$(\{)?(HOME|PWD|OLDPWD|TMPDIR|USER|LOGNAME|SHELL|CLAUDE_[A-Z_]+|PROJECT_DIR)(\})?/;
+function expandSingleAssignments(src) {
+  const assigns = /* @__PURE__ */ new Map();
+  const re = /(^|[\s;&|(])(?:export\s+|local\s+|declare\s+(?:-\w+\s+)?|readonly\s+)?([A-Za-z_][A-Za-z0-9_]*)=("([^"\n]*)"|'([^'\n]*)'|([^\s;&|'"()]*))/g;
+  for (const m of src.matchAll(re)) {
+    const name = m[2];
+    const val = m[4] ?? m[5] ?? m[6] ?? "";
+    if (assigns.has(name)) assigns.set(name, null);
+    else assigns.set(name, /[$`]/.test(val) ? null : val);
+  }
+  let out2 = src;
+  for (const [name, val] of assigns) {
+    if (val === null) continue;
+    out2 = out2.replace(new RegExp(`\\$\\{${name}\\}|\\$${name}(?![A-Za-z0-9_])`, "g"), () => val);
+  }
+  return out2;
+}
+function closeParen(s, open) {
+  let depth = 0;
+  let i = open;
+  let q = null;
+  for (; i < s.length; i++) {
+    const c = s[i];
+    if (q) {
+      if (c === "\\" && q === '"') i++;
+      else if (c === q) q = null;
+      continue;
+    }
+    if (c === "'" || c === '"') q = c;
+    else if (c === "\\") i++;
+    else if (c === "(") depth++;
+    else if (c === ")") {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return s.length;
+}
+function parseShell(src) {
+  const s = expandSingleAssignments(src);
+  const commands = [];
+  const substitutions = [];
+  const n = s.length;
+  let i = 0;
+  let words = [];
+  let redirects = [];
+  let assignments = [];
+  let cur = "";
+  let curDyn = false;
+  let hasWord = false;
+  let curQuotedStart = false;
+  let pendingRedirect = null;
+  let heredocMarkers = [];
+  let prevOp = "";
+  let sawCommandWord = false;
+  const flushWord = () => {
+    if (!hasWord) return;
+    const w = { text: cur, dynamic: curDyn };
+    if (pendingRedirect !== null) {
+      if (pendingRedirect === "<<" || pendingRedirect === "<<-") heredocMarkers.push(cur);
+      else redirects.push({ op: pendingRedirect, target: w });
+      pendingRedirect = null;
+    } else if (!sawCommandWord && !curQuotedStart && /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/.test(cur)) {
+      assignments.push(cur);
+    } else {
+      words.push(w);
+      sawCommandWord = true;
+    }
+    cur = "";
+    curDyn = false;
+    hasWord = false;
+    curQuotedStart = false;
+  };
+  const endCommand = (op) => {
+    flushWord();
+    pendingRedirect = null;
+    if (words.length || redirects.length || assignments.length) {
+      commands.push({ assignments, words, redirects, prev: prevOp, next: op });
+      prevOp = op;
+    } else if (op !== ";" && commands.length) {
+      commands[commands.length - 1].next = op;
+      prevOp = op;
+    }
+    words = [];
+    redirects = [];
+    assignments = [];
+    sawCommandWord = false;
+  };
+  const skipHeredocs = (at) => {
+    let pos = at;
+    for (const marker of heredocMarkers) {
+      const lines = [];
+      let p = pos;
+      while (p < n) {
+        const nl = s.indexOf("\n", p);
+        const end = nl === -1 ? n : nl;
+        lines.push([p, end]);
+        p = end + 1;
+      }
+      const term = lines.findIndex(([a, b]) => s.slice(a, b).replace(/^\t+/, "") === marker);
+      if (term === -1) return pos;
+      pos = Math.min(n, lines[term][1] + 1);
+    }
+    heredocMarkers = [];
+    return pos;
+  };
+  const startWord = () => {
+    if (!hasWord) {
+      hasWord = true;
+      curQuotedStart = false;
+    }
+  };
+  while (i < n) {
+    const c = s[i];
+    if (c === "'") {
+      if (!hasWord) curQuotedStart = true;
+      startWord();
+      const end = s.indexOf("'", i + 1);
+      cur += s.slice(i + 1, end === -1 ? n : end);
+      i = end === -1 ? n : end + 1;
+      continue;
+    }
+    if (c === '"') {
+      if (!hasWord) curQuotedStart = true;
+      startWord();
+      i++;
+      while (i < n && s[i] !== '"') {
+        const d = s[i];
+        if (d === "\\" && i + 1 < n && /["\\$`\n]/.test(s[i + 1])) {
+          if (s[i + 1] !== "\n") cur += s[i + 1];
+          i += 2;
+          continue;
+        }
+        if (d === "$" && s[i + 1] === "(") {
+          const end = closeParen(s, i + 1);
+          substitutions.push(s.slice(i + 2, end - 1));
+          cur += s.slice(i, end);
+          curDyn = true;
+          i = end;
+          continue;
+        }
+        if (d === "`") {
+          const end = s.indexOf("`", i + 1);
+          const stop = end === -1 ? n : end;
+          substitutions.push(s.slice(i + 1, stop));
+          cur += s.slice(i, Math.min(n, stop + 1));
+          curDyn = true;
+          i = stop + 1;
+          continue;
+        }
+        if (d === "$" && !(cur.length === 0 && BENIGN_VARS.test(s.slice(i, i + 40)))) curDyn = true;
+        cur += d;
+        i++;
+      }
+      i++;
+      continue;
+    }
+    if (c === "\\") {
+      if (s[i + 1] === "\n") {
+        i += 2;
+        continue;
+      }
+      startWord();
+      if (i + 1 < n) cur += s[i + 1];
+      i += 2;
+      continue;
+    }
+    if (c === "$" && s[i + 1] === "(") {
+      startWord();
+      const end = closeParen(s, i + 1);
+      substitutions.push(s.slice(i + 2, end - 1));
+      cur += s.slice(i, end);
+      curDyn = true;
+      i = end;
+      continue;
+    }
+    if (c === "`") {
+      startWord();
+      const end = s.indexOf("`", i + 1);
+      const stop = end === -1 ? n : end;
+      substitutions.push(s.slice(i + 1, stop));
+      cur += s.slice(i, Math.min(n, stop + 1));
+      curDyn = true;
+      i = stop + 1;
+      continue;
+    }
+    if (c === "$") {
+      startWord();
+      if (!(cur.length === 0 && BENIGN_VARS.test(s.slice(i, i + 40)))) curDyn = true;
+      cur += c;
+      i++;
+      continue;
+    }
+    if (c === "#" && !hasWord) {
+      const nl = s.indexOf("\n", i);
+      i = nl === -1 ? n : nl;
+      continue;
+    }
+    if (c === "\n") {
+      endCommand(";");
+      i++;
+      if (heredocMarkers.length) i = skipHeredocs(i);
+      continue;
+    }
+    if (c === " " || c === "	" || c === "\r") {
+      flushWord();
+      i++;
+      continue;
+    }
+    if (c === ";") {
+      endCommand(";");
+      i += s[i + 1] === ";" ? 2 : 1;
+      continue;
+    }
+    if (c === "&") {
+      if (s[i + 1] === "&") {
+        endCommand("&&");
+        i += 2;
+      } else if (s[i + 1] === ">") {
+        flushWord();
+        pendingRedirect = s[i + 2] === ">" ? "&>>" : "&>";
+        i += s[i + 2] === ">" ? 3 : 2;
+      } else {
+        endCommand("&");
+        i++;
+      }
+      continue;
+    }
+    if (c === "|") {
+      if (s[i + 1] === "|") {
+        endCommand("||");
+        i += 2;
+      } else if (s[i + 1] === "&") {
+        endCommand("|&");
+        i += 2;
+      } else {
+        endCommand("|");
+        i++;
+      }
+      continue;
+    }
+    if (c === "(" || c === ")") {
+      endCommand(";");
+      i++;
+      continue;
+    }
+    if (c === ">" || c === "<") {
+      let fd = "";
+      if (hasWord && /^\d$/.test(cur) && !curQuotedStart) {
+        fd = cur;
+        cur = "";
+        hasWord = false;
+      } else {
+        flushWord();
+      }
+      let op = c;
+      if (s[i + 1] === c) {
+        op += c;
+        if (c === "<" && s[i + 2] === "<") op += "<";
+        else if (c === "<" && s[i + 2] === "-") op += "-";
+      } else if (c === ">" && (s[i + 1] === "|" || s[i + 1] === "&")) op += s[i + 1];
+      else if (c === "<" && s[i + 1] === "&") op += "&";
+      i += op.length;
+      pendingRedirect = fd + op;
+      continue;
+    }
+    if ((c === "{" || c === "}") && !hasWord && (i + 1 >= n || /[\s;&|]/.test(s[i + 1]))) {
+      i++;
+      continue;
+    }
+    startWord();
+    cur += c;
+    i++;
+  }
+  endCommand("");
+  return { commands, substitutions, text: render(commands) };
+}
+var OUTPUT_ONLY = /* @__PURE__ */ new Set(["echo", "printf"]);
+function baseName(p) {
+  const i = p.lastIndexOf("/");
+  return i === -1 ? p : p.slice(i + 1);
+}
+function render(cmds) {
+  const parts = [];
+  for (const c of cmds) {
+    const head = c.words[0] ? baseName(c.words[0].text) : "";
+    const piped = c.next === "|" || c.next === "|&";
+    const words = OUTPUT_ONLY.has(head) && !piped ? [c.words[0].text] : c.words.map((w) => w.text);
+    const seg = [...c.assignments, ...words, ...c.redirects.map((r) => `${r.op} ${r.target.text}`)].join(" ");
+    parts.push(seg);
+    if (c.next) parts.push(` ${c.next} `);
+  }
+  return parts.join("").trim();
+}
+
+// src/policy.ts
 var READ_ONLY_TOOLS = /* @__PURE__ */ new Set([
   "Read",
   "Glob",
   "Grep",
   "LS",
-  "NotebookRead",
   "WebFetch",
   "WebSearch",
-  "TodoWrite",
   "TodoRead",
-  "AskUserQuestion",
-  "EnterPlanMode",
-  "ExitPlanMode",
-  "Task",
-  "Agent",
-  "Skill",
-  "ToolSearch",
-  "BashOutput",
-  "KillShell",
-  "TaskOutput",
-  "TaskStop",
+  "TodoWrite",
+  "NotebookRead",
   "ListMcpResourcesTool",
   "ReadMcpResourceTool",
   "ReadMcpResourceDirTool",
-  "Monitor"
+  "AskUserQuestion",
+  "ExitPlanMode",
+  "EnterPlanMode",
+  "TaskOutput",
+  "BashOutput",
+  "ToolSearch",
+  "Skill",
+  "ListAgents",
+  "ReadNotifications"
 ]);
 var EDIT_TOOLS = /* @__PURE__ */ new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+var DELEGATION_TOOLS = /* @__PURE__ */ new Set(["Task", "Agent"]);
 var PROTECTED_PATHS = [
   { re: /(^|[\s/'"=:])\.claude(\/|$|[\s'"])/i, label: "claude settings or hooks" },
   { re: /(^|[\s/'"=:])\.humanauth(\/|$|[\s'"])/i, label: "humanauth plugin data" },
@@ -2036,7 +2333,22 @@ var PROTECTED_PATHS = [
   { re: /(^|[\s'"=])\/(usr\/local|usr|opt\/homebrew|opt\/local|home\/linuxbrew\/\.linuxbrew|snap|nix)?\/?s?bin\//i, label: "bin directory", pathsOnly: true },
   { re: /(^|[\s'"=])\/(opt\/homebrew|usr\/local)\/(Cellar|opt|lib)\//i, label: "homebrew install", pathsOnly: true },
   { re: /(^|[\s'"=])\/nix\/store\//i, label: "nix store", pathsOnly: true },
-  { re: /(^|\/)(node|nodejs|npx|npm|pnpm|yarn|bun|deno|sh|bash|zsh|dash|fish|python3?|perl|ruby|env|claude)(\.exe|\.cmd|\.bat)?$/i, label: "interpreter binary", pathsOnly: true }
+  { re: /(^|\/)(node|nodejs|npx|npm|pnpm|yarn|bun|deno|sh|bash|zsh|dash|fish|python3?|perl|ruby|env|claude)(\.exe|\.cmd|\.bat)?$/i, label: "interpreter binary", pathsOnly: true },
+  // Files an ungated command reads to decide what to run: agent instructions,
+  // task runners, package scripts (run on install and lifecycle), editor tasks,
+  // git hook managers, package-manager config. Project files, so in shell text
+  // only a write to them gates.
+  { re: /(^|\/)(CLAUDE|AGENTS)\.md$/i, label: "agent instructions", writesOnly: true },
+  { re: /(^|\/)\.mcp\.json$/i, label: "MCP server config", writesOnly: true },
+  { re: /(^|\/)\.husky(\/|$)/i, label: "git hooks (husky)", writesOnly: true },
+  { re: /(^|\/)\.pre-commit-config\.ya?ml$/i, label: "git hooks (pre-commit)", writesOnly: true },
+  { re: /(^|\/)lefthook(-local)?\.ya?ml$/i, label: "git hooks (lefthook)", writesOnly: true },
+  { re: /(^|\/)\.vscode\/(tasks|settings)\.json$/i, label: "editor tasks or settings", writesOnly: true },
+  { re: /(^|\/)\.idea(\/|$)/i, label: "editor settings", writesOnly: true },
+  { re: /(^|\/)package\.json$/i, label: "package.json (lifecycle scripts)", writesOnly: true },
+  { re: /(^|\/)(Makefile|makefile|GNUmakefile|[Jj]ustfile|Taskfile\.ya?ml|Taskfile\.dist\.ya?ml)$/, label: "task runner file", writesOnly: true },
+  { re: /(^|\/)(\.yarnrc(\.yml)?|\.pnpmfile\.cjs|bunfig\.toml|\.npmrc)$/i, label: "package manager config", writesOnly: true },
+  { re: /(^|\/)\.git\//i, label: "git internals", writesOnly: true }
 ];
 var INTERPRETER_LOCATION = String.raw`(\/(usr\/local\/|usr\/|opt\/homebrew\/|opt\/local\/|home\/linuxbrew\/\.linuxbrew\/)?s?bin\/|\.(nvm|volta|fnm|asdf|nodenv|nodebrew|local\/bin|cargo\/bin|bun\/bin|deno\/bin|n\/bin)\/|\/(opt\/homebrew|usr\/local)\/(Cellar|opt|lib)\/|\/nix\/store\/)`;
 var WRITE_VERBS = String.raw`\b(cp|mv|install|ln|tee|rsync|chmod|chown|touch|dd|patch|sed\s+-i[^\s]*|perl\s+-[a-z]*i|curl\s+-[a-zA-Z]*o|wget\s+-O)\b`;
@@ -2047,14 +2359,22 @@ var INTERPRETER_WRITE = [
   { re: /\b(npm|pnpm|yarn|bun)\s+(i|install|add|rm|remove|uninstall|link|ci|up|upgrade)\b.*\s(-g|--global|-w\s+\S+@)/i, label: "global package change" },
   { re: /\b(corepack|nvm|volta|fnm|n|asdf|mise|nodenv)\s+(install|use|default|alias|pin|global|shell|exec|run|uninstall|set)\b/i, label: "node version change" }
 ];
+var WRITE_COMMANDS = /* @__PURE__ */ new Set(["cp", "mv", "rm", "rmdir", "unlink", "tee", "install", "ln", "touch", "truncate", "shred", "srm", "chmod", "chown", "chgrp", "patch", "dd", "rsync", "sed", "perl"]);
+var GIT_OPTS = String.raw`(\s+-[Cc]\s+\S+|\s+--[a-z-]+(=\S+)?)*`;
 var DESTRUCTIVE_COMMANDS = [
   // `git -C dir push`, `git -c k=v push`, `git --git-dir=x push` all reach push.
-  { re: /\bgit(\s+-[Cc]\s+\S+|\s+--[a-z-]+(=\S+)?)*\s+(push|reset\s+--hard|clean\s+-[a-z]*f|branch\s+-D|tag\s+-d|stash\s+(drop|clear)|remote\s+(set-url|remove|rm|add)|filter-branch|filter-repo|update-ref\s+-d|reflog\s+expire|replace|gc\s+--prune)\b/, label: "git history or remote change" },
-  { re: /\bgit(\s+-[Cc]\s+\S+|\s+--[a-z-]+(=\S+)?)*\s+checkout\s+--\s/, label: "discard working changes" },
+  { re: new RegExp(String.raw`\bgit${GIT_OPTS}\s+(push|reset\s+--hard|clean\s+(-[a-zA-Z]*[fF][a-zA-Z]*|--force)|branch\s+(-[a-zA-Z]*[DdMm][a-zA-Z]*|--delete|--move|--force)|tag\s+(-[a-zA-Z]*[dfF][a-zA-Z]*|--delete|--force)|stash\s+(drop|clear)|remote\s+(set-url|remove|rm|add|rename|prune|set-head|set-branches)|filter-branch|filter-repo|update-ref\s+-d|reflog\s+(expire|delete)|replace|gc\s+--prune|prune\b|lfs\s+(push|prune)|svn\s+dcommit|send-email|imap-send|credential(-\S+)?\s)`), label: "git history or remote change" },
+  { re: new RegExp(String.raw`\bgit${GIT_OPTS}\s+(checkout\s+--\s|restore\b(?!\s+--help))`), label: "discard working changes" },
   // Git config writes can alias `status` to `push`, set hooksPath, or change credential helpers.
-  { re: /\bgit(\s+-[Cc]\s+\S+|\s+--[a-z-]+(=\S+)?)*\s+config\b(?![^|;&]*(\s--get\b|\s--get-all\b|\s--get-regexp\b|\s--list\b|\s-l\b|\s--show-origin\b))[^|;&]*\S\s+\S/, label: "git config write" },
+  { re: new RegExp(String.raw`\bgit${GIT_OPTS}\s+config\b(?![^|;&]*(\s--get\b|\s--get-all\b|\s--get-regexp\b|\s--list\b|\s-l\b|\s--show-origin\b))[^|;&]*\S\s+\S`), label: "git config write" },
+  { re: /\bgit\s+(-\S+\s+)*-c\s+(alias\.|core\.(hooksPath|sshCommand|pager|editor|fsmonitor|askPass)|credential\.|diff\.external|gpg\.program|sequence\.editor|filter\.|merge\.\S*\.driver|url\.|include\.|includeIf\.)/i, label: "git behaviour overridden on the command line" },
+  { re: /\bgit\s+(-\S+\s+)*--config-env\b/, label: "git behaviour overridden on the command line" },
+  { re: /\bnpm\s+(pkg\s+(set|delete|fix)|version\s+\S|init\b)/, label: "package.json write" },
   { re: /(^|[\s;&|(])rm\s+(-[a-zA-Z]*[rRf][a-zA-Z]*\s|--recursive|--force)/, label: "recursive or forced delete" },
   { re: /(^|[\s;&|(])(rmdir|shred|srm)\s/, label: "delete" },
+  { re: /(^|[\s;&|(])unlink\s+\S/, label: "delete" },
+  { re: /(^|[\s;&|(])truncate\s+(-[a-zA-Z]*s|--size)/, label: "truncates a file" },
+  { re: /(^|[\s;&|(])(cp|mv)\s+(-\S+\s+)*\/dev\/null\s+\S/, label: "empties a file" },
   { re: /(^|[\s;&|(])(sudo|doas|su)\s/, label: "privilege escalation" },
   { re: /\b(chmod|chown|chgrp)\s+(-[a-zA-Z]*R|--recursive)/, label: "recursive permission change" },
   { re: /\b(curl|wget|http|https|xh|httpie)\b[^|;&]*\s(-X\s*(POST|PUT|PATCH|DELETE)|--request\s+(POST|PUT|PATCH|DELETE)|-d\s|--data(-raw|-binary|-urlencode)?[\s=]|--json[\s=]|-F\s|--form[\s=]|-T\s|--upload-file[\s=]|--method\s+(POST|PUT|PATCH|DELETE)|POST|PUT|PATCH|DELETE)/i, label: "outbound HTTP write" },
@@ -2095,7 +2415,534 @@ var DESTRUCTIVE_COMMANDS = [
   { re: /\b(security\s+(add-generic-password|delete-generic-password|find-generic-password|find-internet-password|export|import|unlock-keychain)|keychain|secret-tool|pass\s+(insert|rm|edit)|op\s+(item|vault|read|inject)|vault\s+(kv\s+(put|delete)|write|delete)|aws\s+secretsmanager|gcloud\s+secrets|doppler|infisical|sops\s+(-d|--decrypt|-e|--encrypt))\b/, label: "secret store access" },
   { re: /\b(claude|codex|cursor|gemini|copilot|aider|opencode)\s+(plugin|mcp|config|settings|hooks|--dangerously|--permission-mode|-p\s)/, label: "agent configuration" }
 ];
+var GIT_READ_ONLY = /* @__PURE__ */ new Set([
+  "status",
+  "log",
+  "diff",
+  "show",
+  "branch",
+  "fetch",
+  "remote",
+  "rev-parse",
+  "ls-files",
+  "blame",
+  "describe",
+  "tag",
+  "stash",
+  "config",
+  "help",
+  "version",
+  "grep",
+  "ls-tree",
+  "ls-remote",
+  "cat-file",
+  "rev-list",
+  "shortlog",
+  "reflog",
+  "show-ref",
+  "for-each-ref",
+  "name-rev",
+  "merge-base",
+  "diff-tree",
+  "diff-index",
+  "diff-files",
+  "count-objects",
+  "fsck",
+  "verify-commit",
+  "verify-tag",
+  "verify-pack",
+  "check-ignore",
+  "check-attr",
+  "check-ref-format",
+  "var",
+  "whatchanged",
+  "cherry",
+  "range-diff",
+  "worktree",
+  "bisect",
+  "show-branch",
+  "annotate",
+  "archive",
+  "bundle",
+  "request-pull",
+  "column",
+  "mailinfo",
+  "mailsplit",
+  "stripspace",
+  "interpret-trailers"
+]);
+var GIT_LOCAL = /* @__PURE__ */ new Set([
+  "commit",
+  "add",
+  "checkout",
+  "switch",
+  "merge",
+  "rebase",
+  "cherry-pick",
+  "revert",
+  "pull",
+  "clone",
+  "init",
+  "mv",
+  "rm",
+  "apply",
+  "am",
+  "format-patch",
+  "notes",
+  "submodule",
+  "symbolic-ref",
+  "update-index",
+  "read-tree",
+  "write-tree",
+  "commit-tree",
+  "hash-object",
+  "pack-refs",
+  "repack",
+  "maintenance",
+  "sparse-checkout",
+  "lfs",
+  "flow",
+  "svn",
+  "mergetool",
+  "difftool",
+  "citool",
+  "gui",
+  "fast-import",
+  "fast-export",
+  "unpack-objects",
+  "pack-objects",
+  "index-pack",
+  "merge-file",
+  "merge-tree",
+  "merge-index",
+  "patch-id",
+  "rerere",
+  "update-server-info",
+  "upload-pack",
+  "receive-pack",
+  "daemon",
+  "instaweb",
+  "p4",
+  "quiltimport",
+  "replay",
+  "restore",
+  "reset",
+  "clean",
+  "update-ref",
+  "gc",
+  "prune"
+]);
+var GIT_ENV = /^(GIT_(CONFIG_PARAMETERS|CONFIG_GLOBAL|CONFIG_SYSTEM|CONFIG_NOSYSTEM|SSH_COMMAND|SSH|EXEC_PATH|PAGER|EDITOR|SEQUENCE_EDITOR|EXTERNAL_DIFF|ASKPASS|PROXY_COMMAND|TEMPLATE_DIR|DIR|ALTERNATE_OBJECT_DIRECTORIES)|PAGER|EDITOR|VISUAL)=/;
+var GIT_GLOBAL_OPTS_WITH_ARG = /* @__PURE__ */ new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix", "--config-env", "--list-cmds"]);
+function gitSubcommandIndex(words) {
+  let i = 1;
+  while (i < words.length) {
+    const w = words[i].text;
+    if (!w.startsWith("-")) return i;
+    if (GIT_GLOBAL_OPTS_WITH_ARG.has(w)) i += 2;
+    else i += 1;
+  }
+  return -1;
+}
+function analyseGit(c) {
+  for (const a of c.assignments) if (GIT_ENV.test(a)) return `git environment overridden (${a.split("=")[0]})`;
+  const at = gitSubcommandIndex(c.words);
+  if (at === -1) return null;
+  const sub = c.words[at];
+  if (sub.dynamic) return "git subcommand computed at run time";
+  const name = sub.text;
+  if (GIT_READ_ONLY.has(name) || GIT_LOCAL.has(name) || name === "push") return null;
+  return `unknown git subcommand "${name}" (possible alias)`;
+}
+var SHELLS = /* @__PURE__ */ new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "ash", "busybox"]);
+var WRAPPERS = /* @__PURE__ */ new Set(["command", "builtin", "exec", "nohup", "time", "caffeinate", "nice", "ionice", "timeout", "stdbuf", "env", "setsid", "unbuffer", "script"]);
+var WRAPPER_ARG_OPTS = {
+  nice: /* @__PURE__ */ new Set(["-n"]),
+  ionice: /* @__PURE__ */ new Set(["-c", "-n"]),
+  stdbuf: /* @__PURE__ */ new Set(["-i", "-o", "-e"]),
+  env: /* @__PURE__ */ new Set(["-u", "-C", "-S", "--unset", "--chdir"]),
+  timeout: /* @__PURE__ */ new Set(["-s", "-k", "--signal", "--kill-after"])
+};
+var LAUNCHERS = /* @__PURE__ */ new Set([
+  "git",
+  "gh",
+  "glab",
+  "sh",
+  "bash",
+  "zsh",
+  "dash",
+  "ksh",
+  "fish",
+  "node",
+  "bun",
+  "deno",
+  "python",
+  "python3",
+  "python2",
+  "pypy",
+  "perl",
+  "ruby",
+  "php",
+  "npm",
+  "npx",
+  "pnpm",
+  "yarn",
+  "docker",
+  "kubectl",
+  "helm",
+  "aws",
+  "gcloud",
+  "az",
+  "terraform",
+  "tofu",
+  "pulumi",
+  "wrangler",
+  "vercel",
+  "fly",
+  "flyctl",
+  "heroku",
+  "psql",
+  "mysql",
+  "mariadb",
+  "sqlite3",
+  "mongosh",
+  "redis-cli",
+  "ssh",
+  "scp",
+  "sftp",
+  "rsync",
+  "curl",
+  "wget",
+  "eval",
+  "xargs",
+  "env",
+  "sudo",
+  "doas",
+  "su",
+  "make",
+  "just",
+  "task",
+  "stripe",
+  "twilio",
+  "op",
+  "vault",
+  "launchctl",
+  "systemctl"
+]);
+var DANGEROUS = /* @__PURE__ */ new Set(["rm", "rmdir", "unlink", "shred", "srm", "truncate", "mv", "cp", "dd", "chmod", "chown", "chgrp", "kill", "pkill", "killall", "tee", "install", "ln", "sed", "mkfs", "crontab", "defaults"]);
+var INLINE_EXEC = /subprocess|os\.system|\bexec\b|\bspawn|system\s*\(|child_process|Popen|`|\b(git|rm|sudo|doas|curl|wget|ssh|scp|rsync|kubectl|aws|gcloud|az|docker|npm|npx|pnpm|yarn|psql|mysql|shred|dd|chmod|chown|kill|mail|sendmail|push|publish|deploy|terraform|wrangler|vercel)\b/;
+var ONE_LINER_FLAGS = {
+  python: /^-[a-zA-Z]*c$/,
+  python3: /^-[a-zA-Z]*c$/,
+  python2: /^-[a-zA-Z]*c$/,
+  pypy: /^-[a-zA-Z]*c$/,
+  perl: /^-[a-zA-Z]*[eE]$/,
+  ruby: /^-[a-zA-Z]*e$/,
+  php: /^-r$/,
+  node: /^(-e|-p|--eval|--print)$/,
+  nodejs: /^(-e|-p|--eval|--print)$/,
+  bun: /^(-e|--eval|--print)$/
+};
+var INTERPRETERS = /* @__PURE__ */ new Set(["node", "nodejs", "bun", "deno", "tsx", "ts-node", "python", "python3", "python2", "pypy", "ruby", "perl", "php"]);
+var YARN_BUILTINS = /* @__PURE__ */ new Set(["install", "add", "remove", "upgrade", "upgrade-interactive", "why", "info", "list", "cache", "config", "version", "versions", "bin", "link", "unlink", "pack", "login", "logout", "outdated", "check", "licenses", "workspaces", "workspace", "dlx", "set", "up", "dedupe", "explain", "node", "exec", "constraints", "patch", "stage", "search", "init", "help", "import", "generate-lock-entry", "audit"]);
+var TMP_RE = /^(\/private)?\/(tmp|var\/tmp|var\/folders)\//;
+function unwrap(words) {
+  let w = words;
+  for (let guard = 0; guard < 6 && w.length; guard++) {
+    const head = baseName(w[0].text);
+    if (!WRAPPERS.has(head)) break;
+    let i = 1;
+    const argOpts = WRAPPER_ARG_OPTS[head];
+    while (i < w.length) {
+      const t = w[i].text;
+      if (head === "env" && /^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) i++;
+      else if (t.startsWith("-")) i += argOpts?.has(t) ? 2 : 1;
+      else if (head === "timeout" && i === 1 && /^\d/.test(t)) i++;
+      else if (head === "script" && i === 1 && !t.startsWith("-")) i++;
+      else break;
+    }
+    w = w.slice(i);
+  }
+  return w;
+}
+function resolvePath(p, cfg) {
+  if (p.startsWith("~")) return null;
+  if (p.startsWith("/")) return posix.normalize(p);
+  if (!cfg.cwd) return null;
+  return posix.resolve(cfg.cwd, p);
+}
+function executedFile(p, cfg, allowNewness) {
+  const abs = resolvePath(p, cfg);
+  if (!abs) return null;
+  if (cfg.writtenPaths) {
+    for (const w of cfg.writtenPaths) if (w === abs || w.toLowerCase() === abs.toLowerCase()) return `runs ${p}, a file written in this session`;
+  }
+  if (allowNewness && cfg.fs && typeof cfg.sessionStartMs === "number") {
+    const underCwd = cfg.cwd ? abs.startsWith(posix.normalize(cfg.cwd) + "/") : false;
+    if ((underCwd || TMP_RE.test(abs)) && !/\/node_modules\//.test(abs)) {
+      const m = cfg.fs.mtimeMs(abs);
+      if (m !== null && m > cfg.sessionStartMs) return `runs ${p}, a file newer than this session`;
+    }
+  }
+  return null;
+}
+function firstFileArg(words, from, optsWithArg) {
+  for (let i = from; i < words.length; i++) {
+    const t = words[i].text;
+    if (t.startsWith("-")) {
+      if (optsWithArg.has(t)) i++;
+      continue;
+    }
+    return words[i];
+  }
+  return null;
+}
+function analyseIndirection(words, cfg) {
+  const head = baseName(words[0].text);
+  const raw = words[0].text;
+  if (raw.includes("/") && !words[0].dynamic) {
+    const r = executedFile(raw, cfg, true);
+    if (r) return r;
+  }
+  if (SHELLS.has(head)) {
+    const f = firstFileArg(words, 1, /* @__PURE__ */ new Set(["-o", "-O", "+o", "+O", "-c"]));
+    if (f && !f.dynamic) return executedFile(f.text, cfg, true);
+    return null;
+  }
+  if (head === "source" || head === ".") {
+    const f = words[1];
+    if (f && !f.dynamic) return executedFile(f.text, cfg, true);
+    return null;
+  }
+  if (head === "make" || head === "gmake") {
+    let dir = cfg.cwd;
+    let file = null;
+    for (let i = 1; i < words.length; i++) {
+      const t = words[i].text;
+      if ((t === "-f" || t === "--file" || t === "--makefile") && words[i + 1]) file = words[++i].text;
+      else if (t.startsWith("--file=") || t.startsWith("--makefile=")) file = t.split("=").slice(1).join("=");
+      else if ((t === "-C" || t === "--directory") && words[i + 1]) dir = resolvePath(words[++i].text, cfg) ?? dir;
+    }
+    const candidates = file ? [file] : ["GNUmakefile", "makefile", "Makefile"];
+    for (const c of candidates) {
+      const p = file || !dir ? c : posix.join(dir, c);
+      const r = executedFile(p, cfg, true);
+      if (r) return r;
+    }
+    return null;
+  }
+  if (head === "just" || head === "task") {
+    for (const c of head === "just" ? ["justfile", "Justfile"] : ["Taskfile.yml", "Taskfile.yaml"]) {
+      const r = executedFile(c, cfg, true);
+      if (r) return r;
+    }
+    return null;
+  }
+  if (head === "npm" || head === "pnpm" || head === "yarn" || head === "bun") {
+    const sub = words[1]?.text;
+    const hasScript = words[2] !== void 0 && !words[2].text.startsWith("-");
+    const viaScript = head === "npm" && ((sub === "run" || sub === "run-script") && hasScript || sub === "start" || sub === "test" || sub === "stop" || sub === "restart") || (head === "pnpm" || head === "bun") && (sub === "run" && hasScript || sub === "start" || sub === "test") || head === "yarn" && sub !== void 0 && !sub.startsWith("-") && !YARN_BUILTINS.has(sub) && (sub !== "run" || hasScript);
+    if (viaScript) return executedFile("package.json", cfg, true);
+    if (head === "pnpm" && (sub === "exec" || sub === "dlx") || head === "bun" && sub === "x") {
+      const bin = words[2]?.text;
+      if (bin && !bin.startsWith("-")) return executedFile(posix.join("node_modules", ".bin", bin), cfg, false);
+    }
+    if (head === "bun" && sub && !sub.startsWith("-") && /\.[A-Za-z0-9]+$/.test(sub)) return executedFile(sub, cfg, false);
+    return null;
+  }
+  if (head === "npx") {
+    const bin = firstFileArg(words, 1, /* @__PURE__ */ new Set(["-p", "--package", "-c", "--call"]));
+    if (bin && !bin.dynamic) return executedFile(posix.join("node_modules", ".bin", baseName(bin.text)), cfg, false);
+    return null;
+  }
+  if (INTERPRETERS.has(head)) {
+    const f = firstFileArg(words, 1, /* @__PURE__ */ new Set(["-r", "--require", "--import", "--loader", "-m", "-W", "-X", "-I", "-e", "-c", "-p", "--eval", "--print"]));
+    if (f && !f.dynamic && /\.[A-Za-z0-9]+$/.test(f.text)) return executedFile(f.text, cfg, false);
+    return null;
+  }
+  return null;
+}
+function analyseInlineProgram(words) {
+  const head = baseName(words[0].text);
+  const flag = ONE_LINER_FLAGS[head];
+  if (!flag) return null;
+  for (let i = 1; i < words.length; i++) {
+    if (flag.test(words[i].text)) {
+      const program = words.slice(i + 1).map((w) => w.text).join(" ");
+      if (INLINE_EXEC.test(program)) return `${head} one-liner spawns a process or names a gated command`;
+      if (words.slice(i + 1).some((w) => w.dynamic)) return `${head} one-liner computed at run time`;
+      return null;
+    }
+  }
+  return null;
+}
+function analyseXargs(words, c) {
+  const withArg = /* @__PURE__ */ new Set(["-n", "-P", "-L", "-s", "-I", "-d", "-a", "-E", "-l", "--max-args", "--max-procs", "--max-lines", "--max-chars", "--replace", "--delimiter", "--arg-file", "--eof"]);
+  const exec = firstFileArg(words, 1, withArg);
+  if (!exec) return null;
+  if (exec.dynamic) return "xargs runs a command computed at run time";
+  const name = baseName(exec.text);
+  if (LAUNCHERS.has(name) || DANGEROUS.has(name)) return `xargs runs ${name} with arguments from ${c.prev === "|" ? "a pipe" : "stdin"}`;
+  return null;
+}
+function analyseFind(words) {
+  for (let i = 1; i < words.length; i++) {
+    const t = words[i].text;
+    if (t === "-delete") return "find -delete";
+    if ((t === "-exec" || t === "-execdir" || t === "-ok" || t === "-okdir") && words[i + 1]) {
+      const name = baseName(words[i + 1].text);
+      if (words[i + 1].dynamic || LAUNCHERS.has(name) || DANGEROUS.has(name)) return `find ${t} ${name}`;
+    }
+  }
+  return null;
+}
+function analyseTruncation(c, words, cfg) {
+  const head = words[0] ? baseName(words[0].text) : "";
+  if (words.length > 0 && head !== ":" && head !== "true") return null;
+  for (const r of c.redirects) {
+    const op = r.op.replace(/^\d+/, "");
+    if (op !== ">" && op !== ">|" && op !== "&>") continue;
+    const t = r.target.text;
+    if (r.target.dynamic) return `truncates ${t} (path computed at run time)`;
+    if (/^\/dev\//.test(t)) continue;
+    const abs = resolvePath(t, cfg) ?? t;
+    if (TMP_RE.test(abs) || /^\$TMPDIR/.test(t)) continue;
+    const rel = cfg.cwd && abs.startsWith(posix.normalize(cfg.cwd) + "/") ? abs.slice(posix.normalize(cfg.cwd).length + 1) : t.startsWith("/") ? null : t;
+    if (rel && /^(\.\/)?(build|dist|node_modules|out|coverage|\.cache|target)\//.test(rel)) continue;
+    if (cfg.fs && abs.startsWith("/")) {
+      if (cfg.fs.mtimeMs(abs) === null) continue;
+    }
+    return `truncates ${t}`;
+  }
+  return null;
+}
+function analyseProjectFileWrite(c, words) {
+  const writesOnly = PROTECTED_PATHS.filter((p) => p.writesOnly);
+  for (const r of c.redirects) {
+    if (!/^(\d*>>?|>\||&>>?)$/.test(r.op)) continue;
+    for (const { re, label } of writesOnly) if (re.test(r.target.text)) return `writes ${label}`;
+  }
+  if (!words.length) return null;
+  const head = baseName(words[0].text);
+  if (!WRITE_COMMANDS.has(head)) return null;
+  if (head === "sed" && !words.some((w) => /^-[a-zA-Z]*i|^--in-place/.test(w.text))) return null;
+  if (head === "perl" && !words.some((w) => /^-[a-zA-Z]*i/.test(w.text))) return null;
+  for (const w of words.slice(1)) {
+    if (w.text.startsWith("-")) continue;
+    for (const { re, label } of writesOnly) if (re.test(w.text)) return `writes ${label}`;
+  }
+  return null;
+}
+function analyseSimple(c, ctx) {
+  const { cfg } = ctx;
+  const words = unwrap(c.words);
+  const trunc = analyseTruncation(c, words, cfg);
+  if (trunc) return trunc;
+  const projectWrite = analyseProjectFileWrite(c, words);
+  if (projectWrite) return projectWrite;
+  if (!words.length) return null;
+  const cmd = words[0];
+  const head = baseName(cmd.text);
+  if (cmd.dynamic) return "command computed at run time";
+  if (head === "git") return analyseGit({ ...c, words });
+  if (head === "eval") {
+    const rest = words.slice(1);
+    return analyseEvalString(rest.map((w) => w.text).join(" "), rest.some((w) => w.dynamic), "eval", ctx);
+  }
+  if (SHELLS.has(head)) {
+    const at = words.findIndex((w, i) => i > 0 && /^-[a-zA-Z]*c[a-zA-Z]*$/.test(w.text));
+    if (at !== -1 && words[at + 1]) {
+      const prog = words[at + 1];
+      return analyseEvalString(prog.text, prog.dynamic, `${head} -c`, ctx);
+    }
+  }
+  if (head === "xargs") {
+    const r = analyseXargs(words, c);
+    if (r) return r;
+  }
+  if (head === "find") {
+    const r = analyseFind(words);
+    if (r) return r;
+  }
+  const inline = analyseInlineProgram(words);
+  if (inline) return inline;
+  return analyseIndirection(words, cfg);
+}
+function analyseEvalString(program, dynamic, via, ctx) {
+  if (dynamic || /[$`]/.test(program)) return `${via} evaluates generated code`;
+  if (ctx.depth >= 4) return `${via} nests too deep to inspect`;
+  const inner = evaluateBash(program, ctx.cfg, ctx.depth + 1);
+  return inner ? `${inner} (via ${via})` : null;
+}
+function evaluateBash(command, cfg, depth = 0) {
+  const parsed = parseShell(command);
+  const text = parsed.text;
+  const pathDirs = (cfg.pathDirs ?? []).filter((d) => d.length > 1);
+  for (const { re, label, pathsOnly, writesOnly } of PROTECTED_PATHS) {
+    if (!pathsOnly && !writesOnly && re.test(text)) return `touches ${label}`;
+  }
+  for (const { re, label } of INTERPRETER_WRITE) {
+    if (re.test(text)) return label;
+  }
+  if (pathDirs.length > 0 && new RegExp(WRITE_VERBS, "i").test(text)) {
+    for (const d of pathDirs) {
+      if (text.includes(d + "/") || text.endsWith(d)) return `writes into PATH directory ${d}`;
+    }
+  }
+  for (const { re, label } of DESTRUCTIVE_COMMANDS) {
+    if (re.test(text)) return label;
+  }
+  if (depth < 4) {
+    for (const sub of parsed.substitutions) {
+      const r = evaluateBash(sub, cfg, depth + 1);
+      if (r) return `${r} (in a command substitution)`;
+    }
+  } else if (parsed.substitutions.length) {
+    return "command substitution nests too deep to inspect";
+  }
+  const ctx = { cfg, depth };
+  for (const c of parsed.commands) {
+    const r = analyseSimple(c, ctx);
+    if (r) return r;
+  }
+  return null;
+}
 var MCP_WRITE_VERBS = /(^|_)(send|post|publish|create|delete|remove|update|write|merge|pay|transfer|deploy|execute|exec|run|apply|insert|drop|cancel|charge|refund|email|message|reply|comment|upload|invite|revoke|grant|purchase|order|submit|approve|reject|close|archive|move|rename|set|put|patch|edit|add|assign|trigger|dispatch|restart|stop|start|kill|destroy|reset|truncate|migrate|push|commit|release|tag|share|forward|schedule|book|buy|sell|swap|withdraw|deposit|mint|burn|sign|transition|resolve|notify|announce|broadcast|invoke|call|emit|toggle|enable|disable|activate|deactivate|lock|unlock|ban|kick|block|unblock|promote|demote|rotate|generate|provision|deprovision|register|unregister|subscribe|unsubscribe|accept|decline|complete|finish|fulfil|fulfill|ship|dispatch|allocate|reserve|release|escalate|override|force|bypass|wipe|purge|clear|flush|drain|terminate|suspend|resume|redeploy|rollback|scale|exec_sql|query_write)(_|$)/i;
+var SQL_WRITE = /(^|;)\s*(?:(?:--[^\n]*\n|\/\*[\s\S]*?\*\/)\s*)*(INSERT\s+INTO|UPDATE\s+(?:ONLY\s+)?[\w."]+\s+SET|DELETE\s+FROM|DROP\s+(?:TABLE|DATABASE|SCHEMA|INDEX|VIEW|FUNCTION|PROCEDURE|TRIGGER|POLICY|ROLE|USER|EXTENSION|TYPE|SEQUENCE|MATERIALIZED)|ALTER\s+(?:TABLE|DATABASE|SCHEMA|INDEX|VIEW|FUNCTION|ROLE|USER|TYPE|SEQUENCE|SYSTEM|POLICY)|TRUNCATE\s+(?:TABLE\s+)?[\w."]+|CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP\s+|TEMPORARY\s+|UNIQUE\s+|MATERIALIZED\s+)?(?:TABLE|DATABASE|SCHEMA|INDEX|VIEW|FUNCTION|PROCEDURE|TRIGGER|POLICY|ROLE|USER|EXTENSION|TYPE|SEQUENCE|DOMAIN|RULE|PUBLICATION|SUBSCRIPTION)|GRANT\s+[\w,\s]+?\s+(?:ON|TO)\b|REVOKE\s+[\w,\s]+?\s+(?:ON|FROM)\b|MERGE\s+INTO|REPLACE\s+INTO)/i;
+var HTTP_METHOD_KEYS = /^(method|verb|action|http_method|httpMethod|request_method|requestMethod)$/i;
+var HTTP_WRITE_METHODS = /^(POST|PUT|PATCH|DELETE)$/i;
+function inspectMcpInput(value, key, depth) {
+  if (depth > 6) return null;
+  if (typeof value === "string") {
+    if (HTTP_METHOD_KEYS.test(key) && HTTP_WRITE_METHODS.test(value.trim())) return `input ${key}=${value.trim().toUpperCase()}`;
+    const m = SQL_WRITE.exec(value);
+    if (m) return `input contains SQL ${m[2].split(/\s+/)[0].toUpperCase()}`;
+    return null;
+  }
+  if (Array.isArray(value)) {
+    for (const v of value) {
+      const r = inspectMcpInput(v, key, depth + 1);
+      if (r) return r;
+    }
+    return null;
+  }
+  if (value && typeof value === "object") {
+    for (const [k, v] of Object.entries(value)) {
+      const r = inspectMcpInput(v, k, depth + 1);
+      if (r) return r;
+    }
+  }
+  return null;
+}
+var BROWSER_TOOLS = /^(computer|javascript_tool|form_input|navigate|navigate_page|click|fill|fill_form|type_text|type|press_key|key|evaluate_script|drag|select_option|upload_file|file_upload|handle_dialog|run_code(_unsafe)?|new_page|close_page|select_page|emulate|resize_page|resize_window|gif_creator|screencast_(start|stop)|tabs_(create|close)(_mcp)?|browser_batch|batch)$/;
+var BROWSER_PREFIX = /^browser_(?!snapshot$|take_screenshot$|console_messages$|network_requests$|find$|wait_for$|hover$|get_page_text$|read_page$)/;
+var BROWSER_READ_ACTIONS = /* @__PURE__ */ new Set(["screenshot", "read_page", "get_page_text", "find", "zoom", "wait", "scroll", "hover", "tabs_context", "scroll_to", "get_console_messages", "list_tabs"]);
+function browserWrite(tool, input) {
+  if (!BROWSER_TOOLS.test(tool) && !BROWSER_PREFIX.test(tool)) return null;
+  const action = input && typeof input === "object" ? input.action : void 0;
+  if (typeof action === "string" && BROWSER_READ_ACTIONS.has(snakeCase(action))) return null;
+  return `browser automation "${tool}"${typeof action === "string" ? ` (${action})` : ""}`;
+}
 function snakeCase(name) {
   return name.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2").replace(/[-.\s]+/g, "_").toLowerCase();
 }
@@ -2125,30 +2972,25 @@ function evaluate(toolName, toolInput, cfg) {
   const action = actionFor(toolName);
   if (cfg.scope === "off") return { gated: false, action };
   if (READ_ONLY_TOOLS.has(toolName)) return { gated: false, action };
+  if (cfg.extraPatternError) {
+    const refuse = `extra_pattern is not a valid regular expression: ${cfg.extraPatternError}`;
+    return { gated: true, action, matched: "extra_pattern invalid", refuse };
+  }
+  const input = toolInput && typeof toolInput === "object" && !Array.isArray(toolInput) ? toolInput : {};
+  if (toolName === "Bash" && typeof input.command !== "string") return { gated: true, action, matched: "unrecognised input" };
+  if (EDIT_TOOLS.has(toolName) && typeof (input.file_path ?? input.notebook_path) !== "string") return { gated: true, action, matched: "unrecognised input" };
   const subject = subjectOf(toolName, toolInput);
-  if (cfg.extraPattern && cfg.extraPattern.test(subject)) {
-    return { gated: true, action, matched: "operator pattern" };
+  if (cfg.extraPattern) {
+    if (cfg.extraPattern.test(subject)) return { gated: true, action, matched: "operator pattern" };
+    if (toolName === "Bash" && cfg.extraPattern.test(parseShell(subject).text)) return { gated: true, action, matched: "operator pattern" };
   }
   if (cfg.scope === "all") {
     return { gated: true, action, matched: "scope: all" };
   }
   const pathDirs = (cfg.pathDirs ?? []).filter((d) => d.length > 1);
   if (toolName === "Bash") {
-    for (const { re, label, pathsOnly } of PROTECTED_PATHS) {
-      if (!pathsOnly && re.test(subject)) return { gated: true, action, matched: `touches ${label}` };
-    }
-    for (const { re, label } of INTERPRETER_WRITE) {
-      if (re.test(subject)) return { gated: true, action, matched: label };
-    }
-    if (pathDirs.length > 0 && new RegExp(WRITE_VERBS, "i").test(subject)) {
-      for (const d of pathDirs) {
-        if (subject.includes(d + "/") || subject.endsWith(d)) return { gated: true, action, matched: `writes into PATH directory ${d}` };
-      }
-    }
-    for (const { re, label } of DESTRUCTIVE_COMMANDS) {
-      if (re.test(subject)) return { gated: true, action, matched: label };
-    }
-    return { gated: false, action };
+    const matched = evaluateBash(subject, cfg);
+    return matched ? { gated: true, action, matched } : { gated: false, action };
   }
   if (EDIT_TOOLS.has(toolName)) {
     for (const { re, label } of PROTECTED_PATHS) {
@@ -2163,10 +3005,16 @@ function evaluate(toolName, toolInput, cfg) {
   if (toolName.startsWith("mcp__")) {
     const parts = toolName.split("__");
     const tool = parts[parts.length - 1] ?? "";
-    if (MCP_WRITE_VERBS.test(snakeCase(tool))) return { gated: true, action, matched: `MCP tool "${tool}" writes` };
+    const snake = snakeCase(tool);
+    if (MCP_WRITE_VERBS.test(snake)) return { gated: true, action, matched: `MCP tool "${tool}" writes` };
+    const browser = browserWrite(snake, toolInput);
+    if (browser) return { gated: true, action, matched: browser };
+    const inspected = inspectMcpInput(toolInput, "", 0);
+    if (inspected) return { gated: true, action, matched: `MCP tool "${tool}": ${inspected}` };
     return { gated: false, action };
   }
-  return { gated: false, action };
+  if (DELEGATION_TOOLS.has(toolName)) return { gated: true, action, matched: "delegation" };
+  return { gated: true, action, matched: `unknown tool "${toolName}"` };
 }
 
 // src/plan.ts
@@ -2366,6 +3214,63 @@ var FileReplayStore = class {
   }
 };
 
+// src/session.ts
+import { mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync, readdirSync as readdirSync2, statSync as statSync2, unlinkSync as unlinkSync2, renameSync } from "node:fs";
+import { join as join2, resolve } from "node:path";
+import { createHash as createHash4 } from "node:crypto";
+var MAX_WRITTEN = 2e3;
+var KEEP_MS = 7 * 24 * 3600 * 1e3;
+function fileFor(dataDir, sessionId) {
+  return join2(dataDir, "sessions", createHash4("sha256").update(sessionId).digest("hex").slice(0, 32) + ".json");
+}
+function loadSession(dataDir, sessionId, now = Date.now()) {
+  const file = fileFor(dataDir, sessionId);
+  try {
+    const parsed = JSON.parse(readFileSync2(file, "utf8"));
+    if (typeof parsed.started_at === "number" && Array.isArray(parsed.written)) {
+      return { session: sessionId, started_at: parsed.started_at, written: parsed.written.filter((p) => typeof p === "string") };
+    }
+  } catch {
+  }
+  const state = { session: sessionId, started_at: now, written: [] };
+  save(file, state);
+  prune(join2(dataDir, "sessions"), now);
+  return state;
+}
+function recordWritten(dataDir, state, filePath, cwd) {
+  const abs = filePath.startsWith("/") ? resolve(filePath) : cwd ? resolve(cwd, filePath) : null;
+  if (!abs) return state;
+  if (state.written.includes(abs)) return state;
+  const written = [...state.written, abs].slice(-MAX_WRITTEN);
+  const next = { ...state, written };
+  save(fileFor(dataDir, state.session), next);
+  return next;
+}
+function save(file, state) {
+  try {
+    mkdirSync2(join2(file, ".."), { recursive: true, mode: 448 });
+    const tmp = `${file}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(state), { mode: 384 });
+    renameSync(tmp, file);
+  } catch {
+  }
+}
+function prune(dir, now) {
+  let names;
+  try {
+    names = readdirSync2(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    try {
+      const p = join2(dir, name);
+      if (now - statSync2(p).mtimeMs > KEEP_MS) unlinkSync2(p);
+    } catch {
+    }
+  }
+}
+
 // src/hook.ts
 var ASSURANCE_RANK2 = { tap: 0, biometric: 1, elevated: 2, hardware: 2 };
 function readRespondAttempts(v) {
@@ -2412,7 +3317,7 @@ function configFromEnv(env) {
   const onError = pick(env, "ON_ERROR") === "ask" ? "ask" : "deny";
   const minRaw = pick(env, "MIN_ASSURANCE") ?? "biometric";
   const minAssurance = minRaw in ASSURANCE_RANK2 && minRaw !== "hardware" ? minRaw : "biometric";
-  const dataDir = env.CLAUDE_PLUGIN_DATA && env.CLAUDE_PLUGIN_DATA !== "" ? env.CLAUDE_PLUGIN_DATA : join2(homedir(), ".humanauth", "claude-plugin");
+  const dataDir = env.CLAUDE_PLUGIN_DATA && env.CLAUDE_PLUGIN_DATA !== "" ? env.CLAUDE_PLUGIN_DATA : join3(homedir(), ".humanauth", "claude-plugin");
   const pathDirs = (env.PATH ?? "").split(":").map((d) => d.trim().replace(/\/+$/, "")).filter((d) => d.startsWith("/"));
   return {
     apiKey: pick(env, "API_KEY"),
@@ -2439,10 +3344,10 @@ function isLoopback(url) {
 }
 function persistEvidence(dataDir, jti, record) {
   try {
-    const dir = join2(dataDir, "evidence");
-    mkdirSync2(dir, { recursive: true, mode: 448 });
-    const name = createHash4("sha256").update(jti).digest("hex").slice(0, 32) + ".json";
-    writeFileSync(join2(dir, name), JSON.stringify(record, null, 2) + "\n", { mode: 384, flag: "wx" });
+    const dir = join3(dataDir, "evidence");
+    mkdirSync3(dir, { recursive: true, mode: 448 });
+    const name = createHash5("sha256").update(jti).digest("hex").slice(0, 32) + ".json";
+    writeFileSync2(join3(dir, name), JSON.stringify(record, null, 2) + "\n", { mode: 384, flag: "wx" });
     return `evidence/${name}`;
   } catch {
     return void 0;
@@ -2458,17 +3363,51 @@ function out(decision, reason) {
     }
   };
 }
+function mtimeOrNull(p) {
+  try {
+    return statSync3(p).mtimeMs;
+  } catch {
+    return null;
+  }
+}
 function defaultAudit(dataDir) {
   return (e) => {
     try {
-      mkdirSync2(dataDir, { recursive: true, mode: 448 });
-      appendFileSync(join2(dataDir, "audit.jsonl"), JSON.stringify(e) + "\n", { mode: 384 });
+      mkdirSync3(dataDir, { recursive: true, mode: 448 });
+      appendFileSync(join3(dataDir, "audit.jsonl"), JSON.stringify(e) + "\n", { mode: 384 });
     } catch {
     }
   };
 }
 async function runHook(input, cfg, deps) {
-  const policy = evaluate(input.tool_name, input.tool_input, { scope: cfg.scope, extraPattern: cfg.extraPattern, pathDirs: cfg.pathDirs });
+  const cwd = typeof input.cwd === "string" && input.cwd.length > 0 ? input.cwd : void 0;
+  let session;
+  if (cfg.scope !== "off" && typeof input.session_id === "string" && input.session_id.length > 0) {
+    try {
+      session = loadSession(cfg.dataDir, input.session_id);
+    } catch {
+      session = void 0;
+    }
+  }
+  const policy = evaluate(input.tool_name, input.tool_input, {
+    scope: cfg.scope,
+    extraPattern: cfg.extraPattern,
+    pathDirs: cfg.pathDirs,
+    cwd,
+    writtenPaths: session ? new Set(session.written) : void 0,
+    sessionStartMs: session?.started_at,
+    fs: { mtimeMs: (p) => mtimeOrNull(p) }
+  });
+  if (session && EDIT_TOOLS.has(input.tool_name)) {
+    const ti = input.tool_input ?? {};
+    const fp = ti.file_path ?? ti.notebook_path;
+    if (typeof fp === "string" && fp.length > 0) {
+      try {
+        recordWritten(cfg.dataDir, session, fp, cwd);
+      } catch {
+      }
+    }
+  }
   if (!policy.gated) return null;
   const unattended = input.permission_mode === "bypassPermissions" || input.permission_mode === "dontAsk";
   if (unattended && cfg.onError === "ask") cfg = { ...cfg, onError: "deny" };
