@@ -26,6 +26,8 @@ export interface HookConfig {
   approver?: string;
   scope: Scope;
   extraPattern?: RegExp | null;
+  /** The compile error of `extra_pattern`, when it is not a valid regular expression. Every non-read-only call is then refused. */
+  extraPatternError?: string | null;
   ttlSeconds: number;
   platformUrl: string;
   /** Expected `iss` on receipts. Defaults to platformUrl. */
@@ -138,12 +140,16 @@ export function configFromEnv(env: NodeJS.ProcessEnv): HookConfig {
   const scopeRaw = pick(env, "SCOPE") ?? "destructive";
   const scope = (SCOPES.has(scopeRaw) ? scopeRaw : "destructive") as Scope;
   let extraPattern: RegExp | null = null;
+  let extraPatternError: string | null = null;
   const extra = pick(env, "EXTRA_PATTERN");
   if (extra) {
     try {
       extraPattern = new RegExp(extra);
-    } catch {
+    } catch (e) {
+      // Not swallowed: an operator who typed a broken pattern meant to gate
+      // more, so until it is fixed every non-read-only call is refused.
       extraPattern = null;
+      extraPatternError = e instanceof Error ? e.message : String(e);
     }
   }
   const ttlRaw = Number(pick(env, "TTL_SECONDS") ?? 300);
@@ -162,6 +168,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv): HookConfig {
     approver: pick(env, "APPROVER"),
     scope,
     extraPattern,
+    extraPatternError,
     ttlSeconds,
     platformUrl,
     issuer: pick(env, "ISSUER") ?? platformUrl,
@@ -214,6 +221,11 @@ function mtimeOrNull(p: string): number | null {
   }
 }
 
+/** HTTP statuses on the poll that mean "try again": the platform or the network, not the request. */
+function retryablePoll(status: number): boolean {
+  return status >= 500 || status === 404 || status === 410 || status === 429 || status === 408;
+}
+
 function defaultAudit(dataDir: string): (e: AuditEntry) => void {
   return (e) => {
     try {
@@ -229,6 +241,16 @@ interface AuthorizeResponse {
   request_id: string;
   ttl: number;
   expires_at: string;
+}
+
+/** GET /v1/requests/:id, the fields the hook reads. */
+interface PollBody {
+  status?: string;
+  result?: string;
+  receipt_jws?: string | null;
+  respond_attempts?: unknown;
+  tenant?: { tenant_id?: string };
+  tenant_id?: string;
 }
 
 /**
@@ -251,6 +273,7 @@ export async function runHook(input: HookInput, cfg: HookConfig, deps: HookDeps)
   const policy: PolicyDecision = evaluate(input.tool_name, input.tool_input, {
     scope: cfg.scope,
     extraPattern: cfg.extraPattern,
+    extraPatternError: cfg.extraPatternError,
     pathDirs: cfg.pathDirs,
     cwd,
     writtenPaths: session ? new Set(session.written) : undefined,
@@ -297,6 +320,11 @@ export async function runHook(input: HookInput, cfg: HookConfig, deps: HookDeps)
   };
   const fail = (reason: string, extra: Partial<AuditEntry> = {}): HookOutput =>
     finish(cfg.onError, `${reason}${cfg.onError === "ask" ? " (falling back to the keyboard prompt)" : ""}`, extra);
+
+  if (policy.refuse) {
+    // A misconfiguration the operator must fix: refused outright, never `ask`.
+    return finish("deny", `${policy.refuse}. Fix extra_pattern under /plugin → humanauth → Configure (or HUMANAUTH_EXTRA_PATTERN); until then every non-read-only call is refused`);
+  }
 
   if (!cfg.apiKey || !cfg.approver) {
     // Freshly installed and never configured: hand the call back to the
@@ -356,57 +384,82 @@ export async function runHook(input: HookInput, cfg: HookConfig, deps: HookDeps)
   // so a crash or kill in between still leaves the request id on disk.
   audit({ ...base, at: new Date().toISOString(), decision: "pending", reason: `awaiting approval from ${cfg.approver} for up to ${cfg.ttlSeconds}s` });
 
-  // The receipt's `aud` is the tenant id; the platform tells us ours on the
-  // request it just created, over the same authenticated channel.
-  let tenantId: string;
-  try {
-    const res = await deps.fetch(`${cfg.platformUrl}/v1/requests/${encodeURIComponent(authorize.request_id)}`, { headers });
-    if (!res.ok) return fail(`could not read the approval request (HTTP ${res.status})`);
-    // GET /v1/requests/:id nests it as `tenant.tenant_id`; older platforms
-    // (and the list endpoint) put it at the top level.
-    const detail = (await res.json()) as { tenant?: { tenant_id?: string }; tenant_id?: string };
-    const found = detail.tenant?.tenant_id ?? detail.tenant_id;
-    if (typeof found !== "string" || found.length === 0) return fail("approval request carries no tenant_id");
-    tenantId = found;
-  } catch (e) {
-    return fail(`could not read the approval request (${(e as Error).message})`);
-  }
-
-  const verifier = new HumanAuthVerifier({
-    audience: tenantId,
-    issuer: cfg.issuer ?? cfg.platformUrl,
-    ...(deps.jwks ? { jwks: deps.jwks } : { jwksUri: `${cfg.platformUrl}/.well-known/jwks.json` }),
-    replayStore: new FileReplayStore(cfg.dataDir),
-  });
-
   // Poll to a terminal state, then verify. Same loop as the verifier's
   // waitForReceipt, kept here so the raw receipt JWS can be retained as
-  // evidence after verification.
+  // evidence after verification. The receipt's `aud` is the tenant id; the
+  // platform tells us ours on the request it just created, over the same
+  // authenticated channel, so the first successful poll also supplies it.
+  //
+  // A poll that fails (network error, 5xx, 429) is not a denial: the request
+  // is still live on the platform and the approver may be tapping right now.
+  // Failures are retried with the same backoff until the deadline; only a
+  // deadline that passes while still failing refuses the call, naming the
+  // last error. Other 4xx mean the request itself is wrong and fail at once.
   let verified: VerifiedReceipt;
   let receiptJws = "";
+  let tenantId: string | undefined;
   try {
     const now = deps.now ?? (() => Date.now());
     const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
     const deadline = now() + cfg.ttlSeconds * 1000 + 15_000;
     let interval = deps.pollIntervalMs ?? 2_000;
     const url = `${cfg.platformUrl}/v1/requests/${encodeURIComponent(authorize.request_id)}`;
+    let lastError: string | null = null;
+    let consecutiveFailures = 0;
+    let lastStatus: string | undefined;
     for (;;) {
-      const res = await deps.fetch(url, { headers });
-      if (!res.ok) throw new RequestPollError(`GET /v1/requests/${authorize.request_id} → HTTP ${res.status}`);
-      const body = (await res.json()) as { status?: string; result?: string; receipt_jws?: string | null; respond_attempts?: unknown };
-      rejected = readRespondAttempts(body.respond_attempts) ?? rejected;
-      if (body.status === "expired") throw new ApprovalExpiredError(`request ${authorize.request_id} expired`);
-      if (body.status === "decided") {
-        if (body.result === "denied") throw new ApprovalDeniedError(`request ${authorize.request_id} was denied`);
-        if (typeof body.receipt_jws === "string" && body.receipt_jws.length > 0) {
-          receiptJws = body.receipt_jws;
-          break;
+      let body: PollBody | null = null;
+      try {
+        const res = await deps.fetch(url, { headers });
+        if (res.ok) {
+          body = (await res.json()) as PollBody;
+        } else if (retryablePoll(res.status)) {
+          lastError = `HTTP ${res.status}`;
+        } else {
+          throw new RequestPollError(`GET /v1/requests/${authorize.request_id} → HTTP ${res.status}`);
         }
+      } catch (e) {
+        if (e instanceof RequestPollError) throw e;
+        lastError = (e as Error).message;
       }
-      if (now() >= deadline) throw new ApprovalTimeoutError(`request ${authorize.request_id} still ${body.status ?? "pending"}`);
+      if (body) {
+        consecutiveFailures = 0;
+        lastError = null;
+        if (!tenantId) {
+          // GET /v1/requests/:id nests it as `tenant.tenant_id`; older
+          // platforms (and the list endpoint) put it at the top level.
+          const found = body.tenant?.tenant_id ?? body.tenant_id;
+          if (typeof found !== "string" || found.length === 0) return fail("approval request carries no tenant_id");
+          tenantId = found;
+        }
+        rejected = readRespondAttempts(body.respond_attempts) ?? rejected;
+        lastStatus = body.status;
+        if (body.status === "expired") throw new ApprovalExpiredError(`request ${authorize.request_id} expired`);
+        if (body.status === "decided") {
+          if (body.result === "denied") throw new ApprovalDeniedError(`request ${authorize.request_id} was denied`);
+          if (typeof body.receipt_jws === "string" && body.receipt_jws.length > 0) {
+            receiptJws = body.receipt_jws;
+            break;
+          }
+        }
+      } else {
+        consecutiveFailures++;
+      }
+      if (now() >= deadline) {
+        if (lastError !== null) {
+          throw new RequestPollError(`GET /v1/requests/${authorize.request_id} kept failing until the deadline (${consecutiveFailures} consecutive failures, last error: ${lastError})`);
+        }
+        throw new ApprovalTimeoutError(`request ${authorize.request_id} still ${lastStatus ?? "pending"}`);
+      }
       await sleep(Math.max(0, Math.min(interval, deadline - now())));
       interval = Math.min(Math.floor(interval * 1.5), 15_000);
     }
+    const verifier = new HumanAuthVerifier({
+      audience: tenantId!,
+      issuer: cfg.issuer ?? cfg.platformUrl,
+      ...(deps.jwks ? { jwks: deps.jwks } : { jwksUri: `${cfg.platformUrl}/.well-known/jwks.json` }),
+      replayStore: new FileReplayStore(cfg.dataDir),
+    });
     verified = await verifier.requireReceipt(receiptJws, {
       action: policy.action,
       plan,

@@ -1,15 +1,16 @@
 // Findings of the external QA pass of 2026-11-09, one block per finding id.
 // Each test failed against v0.1.5 and passes against the fix.
 
-import { describe, it, expect } from "vitest";
-import { mkdtempSync, existsSync } from "node:fs";
+import { describe, it, expect, beforeEach } from "vitest";
+import { mkdtempSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { evaluate, READ_ONLY_TOOLS, type PolicyConfig } from "../src/policy.js";
 import { parseShell } from "../src/shell.js";
-import { runHook, type HookConfig, type AuditEntry } from "../src/hook.js";
+import { buildPlan, planHash, describe as caption, maskSecrets, type HookInput } from "../src/plan.js";
+import { runHook, configFromEnv, type HookConfig, type AuditEntry } from "../src/hook.js";
 import { loadSession, recordWritten } from "../src/session.js";
-import { createFakePlatform } from "./fake-platform.js";
+import { createFakePlatform, type FakePlatform } from "./fake-platform.js";
 
 const d: PolicyConfig = { scope: "destructive" };
 const bash = (command: string, cfg: PolicyConfig = d) => evaluate("Bash", { command }, cfg);
@@ -491,3 +492,224 @@ describe("T1-7 pure output does not gate", () => {
 });
 
 // ===========================================================================
+// TIER 2 — hook and plan
+// ===========================================================================
+
+const BASE = "https://platform.test";
+let platform: FakePlatform;
+let cfg: HookConfig;
+let audit: AuditEntry[];
+const deps = (fetchImpl?: typeof fetch) => ({ fetch: fetchImpl ?? platform.fetch, jwks: platform.jwks, sleep: async () => {}, pollIntervalMs: 1, audit: (e: AuditEntry) => void audit.push(e) });
+const input = (over: Partial<HookInput> = {}): HookInput => ({
+  session_id: "sess_qa2",
+  tool_use_id: "toolu_" + Math.random().toString(36).slice(2, 10),
+  tool_name: "Bash",
+  tool_input: { command: "git push origin main" },
+  cwd: "/Users/me/repo",
+  hook_event_name: "PreToolUse",
+  ...over,
+});
+
+beforeEach(async () => {
+  platform = await createFakePlatform({ baseUrl: BASE });
+  audit = [];
+  cfg = { apiKey: "ha_test_key", approver: "hu_alice", scope: "destructive", ttlSeconds: 300, platformUrl: BASE, onError: "deny", minAssurance: "biometric", allowInsecureUrl: false, pathDirs: [], dataDir: mkdtempSync(join(tmpdir(), "humanauth-qa2-")) };
+});
+
+describe("T2-1 secret masking", () => {
+  it("masks URL userinfo, bearer tokens, password= forms and well-known token shapes", () => {
+    const cases: Array<[string, string]> = [
+      ["git push https://alice:hunter2@github.com/o/r.git main", "git push https://alice:•••@github.com/o/r.git main"],
+      ["curl -H 'Authorization: Bearer abcdef123456789' https://x", "curl -H 'Authorization: Bearer •••' https://x"],
+      ["mysql -u root -pS3cret db -e 'DROP TABLE t'", "mysql -u root -p••• db -e 'DROP TABLE t'"],
+      ["psql --password=s3cret -c 'select 1'", "psql --password=••• -c 'select 1'"],
+      ["export PASSWORD=hunter2 && ./run", "export PASSWORD=••• && ./run"],
+      ["DATABASE_PASSWORD=x9 API_KEY=abc node x", "DATABASE_PASSWORD=••• API_KEY=••• node x"],
+      ["gh auth login --with-token <<< ghp_abcdefghijklmnopqrstuvwxyz0123456789", "gh auth login --with-token <<< ghp_•••"],
+      ["echo github_pat_11AAAAAAA0abcdefghijklmnopqrstuvwxyz", "echo github_pat_•••"],
+      ["OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz1234 run", "OPENAI_API_KEY=••• run"],
+      ["stripe charges create --api-key sk_live_abcdefghijklmnop", "stripe charges create --api-key sk_live_•••"],
+      ["curl -u x:y -H 'X-Key: sk_test_abcdefghijklmnop'", "curl -u x:y -H 'X-Key: sk_test_•••'"],
+      ["HUMANAUTH_API_KEY=ha_live_abcdefghijklmnop node hook", "HUMANAUTH_API_KEY=••• node hook"],
+      ["slack token xoxb-1234567890-abcdefghijk", "slack token xox•••"],
+      ["AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE aws s3 ls", "AWS_ACCESS_KEY_ID=••• aws s3 ls"],
+      ["key AIzaSyA-abcdefghijklmnopqrstuvwxyz0123456", "key AIza•••"],
+      ["token ya29.a0AfH6SMBabcdefghijklmnopqrstuvwxyz", "token ya29.•••"],
+      ["jwt eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c", "jwt eyJ•••"],
+    ];
+    for (const [raw, masked] of cases) {
+      expect(maskSecrets(raw).masked, raw).toBe(masked);
+      expect(maskSecrets(raw).changed, raw).toBe(true);
+    }
+  });
+  it("leaves ordinary commands untouched", () => {
+    for (const c of ["git push origin main", "curl -X POST https://api.example.com/v1/charges -d amount=100", "echo eyJ short", "npm run build -- --token-ring", "ls -p", "mysql -u root -p db"]) {
+      expect(maskSecrets(c)).toEqual({ masked: c, changed: false });
+    }
+  });
+  it("the plan carries the masked command, command_masked and the sha256 of the unmasked command; the caption is masked", () => {
+    const i = input({ tool_input: { command: "git push https://alice:hunter2@github.com/o/r.git main" } });
+    const plan = buildPlan(i);
+    expect(plan.command).toBe("git push https://alice:•••@github.com/o/r.git main");
+    expect(plan.command_masked).toBe(true);
+    expect(plan.command_secret_sha256).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(JSON.stringify(plan)).not.toContain("hunter2");
+    expect(caption(i, plan)).not.toContain("hunter2");
+    expect(caption(i, plan)).toContain("alice:•••@");
+    // Two commands that differ only in the secret hash differently: the receipt binds the real one.
+    const other = buildPlan({ ...i, tool_input: { command: "git push https://alice:hunter3@github.com/o/r.git main" } });
+    expect(other.command).toBe(plan.command);
+    expect(planHash(other)).not.toBe(planHash(plan));
+  });
+  it("Write content and Edit previews are masked too, with the unmasked hashes kept", () => {
+    const w = buildPlan(input({ tool_name: "Write", tool_input: { file_path: "/r/.env", content: "SECRET=1\nPORT=3000\n" } }));
+    expect(w.content).toBe("SECRET=•••\nPORT=3000\n");
+    expect(w.content_masked).toBe(true);
+    expect(w.content_sha256).toBe(buildPlan(input({ tool_name: "Write", tool_input: { file_path: "/r/.env", content: "SECRET=1\nPORT=3000\n" } })).content_sha256);
+    const e = buildPlan(input({ tool_name: "Edit", tool_input: { file_path: "/r/.env", old_string: "TOKEN=old", new_string: "TOKEN=new" } }));
+    expect(e.old_preview).toBe("TOKEN=•••");
+    expect(e.new_preview).toBe("TOKEN=•••");
+    expect(e.old_masked).toBe(true);
+    expect(e.old_sha256).not.toBe(e.new_sha256);
+    const long = buildPlan(input({ tool_input: { command: "curl -H 'Authorization: Bearer abcdefghijklmnop' " + "x".repeat(4100) } }));
+    expect(String(long.command_preview)).toContain("Bearer •••");
+    expect(long.command_masked).toBe(true);
+    expect(long.command_sha256).toMatch(/^sha256:/);
+  });
+  for (const command of [
+    "git push https://alice:hunter2@github.com/o/r.git main",
+    "curl -X POST -H 'Authorization: Bearer abcdefghijklmnop' https://api.example.com/v1/x",
+    "PASSWORD=hunter2 psql -c 'DROP TABLE t'",
+  ]) {
+    it(`end to end: the platform never sees the secret and the receipt still verifies — ${command.slice(0, 30)}…`, async () => {
+      const r = await runHook(input({ tool_input: { command } }), cfg, deps());
+      expect(r?.hookSpecificOutput.permissionDecision).toBe("allow");
+      const sent = JSON.stringify(platform.recorded.authorizeBodies[0]);
+      expect(sent).not.toContain("hunter2");
+      expect(sent).not.toContain("abcdefghijklmnop");
+      expect(sent).toContain("•••");
+      const body = platform.recorded.authorizeBodies[0] as { plan: Record<string, unknown>; description: string };
+      expect(body.plan.command_masked).toBe(true);
+      expect(body.plan.command_secret_sha256).toMatch(/^sha256:/);
+      expect(body.description).toContain("•••");
+      expect(audit.at(-1)!.plan_hash).toBe(planHash(body.plan as never));
+      const ev = JSON.parse(readFileSync(join(cfg.dataDir, audit.at(-1)!.evidence!), "utf8"));
+      expect(JSON.stringify(ev.plan)).not.toContain("hunter2");
+      expect(ev.plan.command_secret_sha256).toBe(body.plan.command_secret_sha256);
+    });
+  }
+});
+
+describe("T2-2 poll resilience", () => {
+  it("a 503 on the poll is retried, and the approval that follows is allowed", async () => {
+    let polls = 0;
+    const flaky: typeof fetch = async (url, init) => {
+      if (String(url).includes("/v1/requests/") && ++polls === 2) return new Response(JSON.stringify({ error: { code: "unavailable" } }), { status: 503 });
+      return platform.fetch(url, init);
+    };
+    const r = await runHook(input(), cfg, deps(flaky));
+    expect(r?.hookSpecificOutput.permissionDecision).toBe("allow");
+    expect(polls).toBeGreaterThanOrEqual(3);
+  });
+  it("a network error on the poll is retried too", async () => {
+    let polls = 0;
+    const flaky: typeof fetch = async (url, init) => {
+      if (String(url).includes("/v1/requests/") && ++polls <= 2) throw new TypeError("fetch failed");
+      return platform.fetch(url, init);
+    };
+    const r = await runHook(input(), cfg, deps(flaky));
+    expect(r?.hookSpecificOutput.permissionDecision).toBe("allow");
+  });
+  it("a poll that keeps failing until the deadline denies with the last error", async () => {
+    const down: typeof fetch = async (url, init) => {
+      if (String(url).includes("/v1/requests/")) return new Response("{}", { status: 502 });
+      return platform.fetch(url, init);
+    };
+    let t = 0;
+    const r = await runHook(input(), cfg, { ...deps(down), now: () => (t += 60_000) });
+    expect(r?.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(r?.hookSpecificOutput.permissionDecisionReason).toContain("could not poll the approval request");
+    expect(r?.hookSpecificOutput.permissionDecisionReason).toContain("last error: HTTP 502");
+    expect(r?.hookSpecificOutput.permissionDecisionReason).toMatch(/\d+ consecutive failures/);
+  });
+  it("a 4xx other than 404/410/429 on the poll still fails at once", async () => {
+    let polls = 0;
+    const forbidden: typeof fetch = async (url, init) => {
+      if (String(url).includes("/v1/requests/") && ++polls === 2) return new Response("{}", { status: 403 });
+      return platform.fetch(url, init);
+    };
+    const r = await runHook(input(), cfg, deps(forbidden));
+    expect(r?.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(r?.hookSpecificOutput.permissionDecisionReason).toContain("HTTP 403");
+    expect(polls).toBe(2);
+  });
+});
+
+describe("T2-3 invalid extra_pattern fails closed", () => {
+  it("configFromEnv keeps the compile error instead of swallowing it", () => {
+    const c = configFromEnv({ CLAUDE_PLUGIN_OPTION_EXTRA_PATTERN: "(" });
+    expect(c.extraPattern).toBeNull();
+    expect(c.extraPatternError).toMatch(/Invalid regular expression/);
+    expect(configFromEnv({ CLAUDE_PLUGIN_OPTION_EXTRA_PATTERN: "make\\s+release" }).extraPatternError).toBeNull();
+  });
+  it("evaluate refuses every non-read-only call with the reason, in both gated scopes", () => {
+    const bad: PolicyConfig = { scope: "destructive", extraPatternError: "Unterminated group" };
+    for (const [t, i] of [["Bash", { command: "ls" }], ["Write", { file_path: "/r/src/a.ts", content: "" }], ["mcp__x__list", {}]] as const) {
+      const r = evaluate(t, i, bad);
+      expect(r.gated, t).toBe(true);
+      expect(r.refuse, t).toBe("extra_pattern is not a valid regular expression: Unterminated group");
+    }
+    expect(evaluate("Read", { file_path: "/x" }, bad).gated).toBe(false);
+    expect(evaluate("Bash", { command: "ls" }, { ...bad, scope: "all" }).refuse).toBeTruthy();
+    expect(evaluate("Bash", { command: "rm -rf /" }, { ...bad, scope: "off" }).gated).toBe(false);
+  });
+  it("runHook denies without calling the platform, and read-only calls still pass", async () => {
+    const c = { ...cfg, ...configFromEnv({ CLAUDE_PLUGIN_OPTION_EXTRA_PATTERN: "[" }), apiKey: "k", approver: "hu_alice", platformUrl: BASE, dataDir: cfg.dataDir, onError: "ask" as const };
+    const r = await runHook(input({ tool_input: { command: "ls" } }), c, deps());
+    expect(r?.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(r?.hookSpecificOutput.permissionDecisionReason).toContain("extra_pattern is not a valid regular expression:");
+    expect(platform.recorded.authorizeBodies).toHaveLength(0);
+    expect(audit.at(-1)).toMatchObject({ decision: "deny", matched: "extra_pattern invalid" });
+    expect(await runHook(input({ tool_name: "Read", tool_input: { file_path: "/etc/hosts" } }), c, deps())).toBeNull();
+  });
+});
+
+describe("T2-4 control characters in the caption", () => {
+  it("are shown as ⟨U+XXXX⟩ so the approver can see what was there", () => {
+    const i = input({ tool_input: { command: "git push origin main ‮# \u001b[2K harmless\u0000" } });
+    const text = caption(i, buildPlan(i));
+    expect(text).toContain("⟨U+202E⟩");
+    expect(text).toContain("⟨U+001B⟩");
+    expect(text).toContain("⟨U+0000⟩");
+    expect(text).not.toContain("�");
+    expect(text).not.toContain("‮");
+  });
+});
+
+describe("T2-5 non-string subject is gated, then refused by the plan builder", () => {
+  it("Bash without a string command, Write/Edit without a string file_path", () => {
+    for (const [t, i] of [
+      ["Bash", {}],
+      ["Bash", { command: 42 }],
+      ["Bash", { command: ["rm", "-rf", "/"] }],
+      ["Bash", null],
+      ["Write", { content: "x" }],
+      ["Write", { file_path: ["/r/.env"], content: "x" }],
+      ["Edit", { file_path: null, old_string: "a", new_string: "b" }],
+      ["MultiEdit", { edits: [] }],
+      ["NotebookEdit", { notebook_path: 1 }],
+    ] as const) {
+      const r = evaluate(t, i, d);
+      expect(r.gated, `${t} ${JSON.stringify(i)}`).toBe(true);
+      expect(r.matched).toBe("unrecognised input");
+    }
+  });
+  it("runHook turns it into a deny with the validation reason and no platform call", async () => {
+    const r = await runHook(input({ tool_input: { command: { $cmd: "rm -rf /" } } }), cfg, deps());
+    expect(r?.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(r?.hookSpecificOutput.permissionDecisionReason).toContain("must be a string");
+    expect(platform.recorded.authorizeBodies).toHaveLength(0);
+    const w = await runHook(input({ tool_name: "Write", tool_input: { content: "x" } }), cfg, deps());
+    expect(w?.hookSpecificOutput.permissionDecision).toBe("deny");
+  });
+});

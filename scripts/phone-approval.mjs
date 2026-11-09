@@ -3043,15 +3043,56 @@ function optionalString(obj, key) {
 }
 var TAIL_LIMIT = 300;
 var DECEPTIVE_CHARS = new RegExp("[\\u0000-\\u0008\\u000b-\\u001f\\u007f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2064\\u2066-\\u2069\\ufeff]");
+var MASK = "\u2022\u2022\u2022";
+var SECRET_PATTERNS = [
+  // URL userinfo: scheme://user:pass@host
+  [/(\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@'"]+):([^\s@'"]+)@/gi, `$1:${MASK}@`],
+  // Authorization headers and bearer tokens
+  [/(\bBearer\s+)[A-Za-z0-9._~+/=-]{8,}/g, `$1${MASK}`],
+  [/(\bAuthorization:\s*(?:Basic|Token|token|Bearer)?\s*)[A-Za-z0-9._~+/=-]{8,}/g, `$1${MASK}`],
+  // key=value forms: password=, PASSWORD=, api_key=, token=, secret=, with optional quotes and -D/--define prefixes
+  [/(\b[A-Za-z_]*(?:password|passwd|pwd|secret|token|api_?key|access_key|private_key|client_secret)[A-Za-z_]*\s*[=:]\s*["']?)(?!["'\s])([^\s"'&;,]+)/gi, (_m, pre) => `${pre}${MASK}`],
+  // mysql/psql style inline passwords: -pSECRET, --password=SECRET, --password SECRET, PGPASSWORD=
+  [/(\b(?:mysql|mariadb|mysqladmin|mysqldump|mysqlimport|psql|pg_dump|pg_restore|mongosh|mongo|redis-cli)\b[^|;&\n]*?\s-p)(?=\S)([^\s]+)/g, `$1${MASK}`],
+  [/(--password[= ])(?!["'\s])(\S+)/g, `$1${MASK}`],
+  [/(\bredis-cli\b[^|;&\n]*?\s-a\s+)(\S+)/g, `$1${MASK}`],
+  // Well-known token shapes
+  [/\b(gh[pousr])_[A-Za-z0-9]{20,}\b/g, `$1_${MASK}`],
+  [/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, `github_pat_${MASK}`],
+  [/\bsk_(live|test)_[A-Za-z0-9]{8,}\b/g, `sk_$1_${MASK}`],
+  [/\brk_(live|test)_[A-Za-z0-9]{8,}\b/g, `rk_$1_${MASK}`],
+  [/\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}\b/g, `sk-${MASK}`],
+  [/\bha_(live|test)_[A-Za-z0-9_-]{8,}\b/g, `ha_$1_${MASK}`],
+  [/\bxox[abposr]-[A-Za-z0-9-]{10,}\b/g, `xox${MASK}`],
+  [/\bAKIA[0-9A-Z]{16}\b/g, `AKIA${MASK}`],
+  [/\bAIza[0-9A-Za-z_-]{30,}\b/g, `AIza${MASK}`],
+  [/\bya29\.[0-9A-Za-z_-]{20,}\b/g, `ya29.${MASK}`],
+  [/\bglpat-[A-Za-z0-9_-]{16,}\b/g, `glpat-${MASK}`],
+  [/\bnpm_[A-Za-z0-9]{30,}\b/g, `npm_${MASK}`],
+  // JWTs: three base64url segments, 40+ chars in all
+  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, (m) => m.length >= 40 ? `eyJ${MASK}` : m],
+  // PEM blocks
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, `-----BEGIN PRIVATE KEY-----${MASK}-----END PRIVATE KEY-----`]
+];
+function maskSecrets(text) {
+  let out2 = text;
+  for (const [re, rep] of SECRET_PATTERNS) {
+    out2 = typeof rep === "string" ? out2.replace(re, rep) : out2.replace(re, rep);
+  }
+  return { masked: out2, changed: out2 !== text };
+}
 function textFields(plan, name, value) {
+  const { masked, changed } = maskSecrets(value);
   if (value.length <= INLINE_LIMIT) {
-    plan[name] = value;
+    plan[name] = masked;
+    if (changed) plan[`${name}_secret_sha256`] = sha256(value);
   } else {
     plan[`${name}_sha256`] = sha256(value);
     plan[`${name}_chars`] = value.length;
-    plan[`${name}_preview`] = value.slice(0, PREVIEW_LIMIT);
-    plan[`${name}_tail`] = value.slice(-TAIL_LIMIT);
+    plan[`${name}_preview`] = masked.slice(0, PREVIEW_LIMIT);
+    plan[`${name}_tail`] = masked.slice(-TAIL_LIMIT);
   }
+  if (changed) plan[`${name}_masked`] = true;
   if (DECEPTIVE_CHARS.test(value)) plan[`${name}_has_control_chars`] = true;
 }
 function buildPlan(input) {
@@ -3092,13 +3133,15 @@ function buildPlan(input) {
       plan.file_path = filePath;
       plan.bytes = Buffer.byteLength(content, "utf8");
       plan.content_sha256 = sha256(content);
+      const { masked, changed } = maskSecrets(content);
       if (content.length <= INLINE_LIMIT) {
-        plan.content = content;
+        plan.content = masked;
       } else {
         plan.content_chars = content.length;
-        plan.content_preview = content.slice(0, PREVIEW_LIMIT);
-        plan.content_tail = content.slice(-TAIL_LIMIT);
+        plan.content_preview = masked.slice(0, PREVIEW_LIMIT);
+        plan.content_tail = masked.slice(-TAIL_LIMIT);
       }
+      if (changed) plan.content_masked = true;
       if (DECEPTIVE_CHARS.test(content)) plan.content_has_control_chars = true;
       break;
     }
@@ -3109,8 +3152,12 @@ function buildPlan(input) {
       plan.file_path = filePath;
       plan.old_sha256 = sha256(oldS);
       plan.new_sha256 = sha256(newS);
-      plan.old_preview = oldS.slice(0, PREVIEW_LIMIT);
-      plan.new_preview = newS.slice(0, PREVIEW_LIMIT);
+      const oldM = maskSecrets(oldS);
+      const newM = maskSecrets(newS);
+      plan.old_preview = oldM.masked.slice(0, PREVIEW_LIMIT);
+      plan.new_preview = newM.masked.slice(0, PREVIEW_LIMIT);
+      if (oldM.changed) plan.old_masked = true;
+      if (newM.changed) plan.new_masked = true;
       plan.replace_all = obj.replace_all === true;
       break;
     }
@@ -3138,7 +3185,7 @@ function planHash(plan) {
 function describe(input, plan) {
   const where = typeof input.cwd === "string" && input.cwd ? ` in ${input.cwd.split("/").filter(Boolean).pop() ?? input.cwd}` : "";
   const clip = (s, n = 140) => {
-    const clean = s.replace(new RegExp(DECEPTIVE_CHARS.source, "g"), "\uFFFD");
+    const clean = s.replace(new RegExp(DECEPTIVE_CHARS.source, "g"), (ch) => `\u27E8U+${ch.codePointAt(0).toString(16).toUpperCase().padStart(4, "0")}\u27E9`);
     return clean.length > n ? clean.slice(0, n - 1) + "\u2026" : clean;
   };
   switch (input.tool_name) {
@@ -3303,12 +3350,14 @@ function configFromEnv(env) {
   const scopeRaw = pick(env, "SCOPE") ?? "destructive";
   const scope = SCOPES.has(scopeRaw) ? scopeRaw : "destructive";
   let extraPattern = null;
+  let extraPatternError = null;
   const extra = pick(env, "EXTRA_PATTERN");
   if (extra) {
     try {
       extraPattern = new RegExp(extra);
-    } catch {
+    } catch (e) {
       extraPattern = null;
+      extraPatternError = e instanceof Error ? e.message : String(e);
     }
   }
   const ttlRaw = Number(pick(env, "TTL_SECONDS") ?? 300);
@@ -3324,6 +3373,7 @@ function configFromEnv(env) {
     approver: pick(env, "APPROVER"),
     scope,
     extraPattern,
+    extraPatternError,
     ttlSeconds,
     platformUrl,
     issuer: pick(env, "ISSUER") ?? platformUrl,
@@ -3370,6 +3420,9 @@ function mtimeOrNull(p) {
     return null;
   }
 }
+function retryablePoll(status) {
+  return status >= 500 || status === 404 || status === 410 || status === 429 || status === 408;
+}
 function defaultAudit(dataDir) {
   return (e) => {
     try {
@@ -3392,6 +3445,7 @@ async function runHook(input, cfg, deps) {
   const policy = evaluate(input.tool_name, input.tool_input, {
     scope: cfg.scope,
     extraPattern: cfg.extraPattern,
+    extraPatternError: cfg.extraPatternError,
     pathDirs: cfg.pathDirs,
     cwd,
     writtenPaths: session ? new Set(session.written) : void 0,
@@ -3426,6 +3480,9 @@ async function runHook(input, cfg, deps) {
     return out(decision, `HumanAuth: ${reason}`);
   };
   const fail = (reason, extra = {}) => finish(cfg.onError, `${reason}${cfg.onError === "ask" ? " (falling back to the keyboard prompt)" : ""}`, extra);
+  if (policy.refuse) {
+    return finish("deny", `${policy.refuse}. Fix extra_pattern under /plugin \u2192 humanauth \u2192 Configure (or HUMANAUTH_EXTRA_PATTERN); until then every non-read-only call is refused`);
+  }
   if (!cfg.apiKey || !cfg.approver) {
     const decision = unattended ? "deny" : "ask";
     return finish(decision, `plugin is not configured${decision === "ask" ? ", falling back to the keyboard prompt" : ""}. Set api_key and approver under /plugin \u2192 humanauth \u2192 Configure, or HUMANAUTH_API_KEY and HUMANAUTH_APPROVER in the environment`);
@@ -3473,48 +3530,69 @@ async function runHook(input, cfg, deps) {
   }
   base.request_id = authorize.request_id;
   audit({ ...base, at: (/* @__PURE__ */ new Date()).toISOString(), decision: "pending", reason: `awaiting approval from ${cfg.approver} for up to ${cfg.ttlSeconds}s` });
-  let tenantId;
-  try {
-    const res = await deps.fetch(`${cfg.platformUrl}/v1/requests/${encodeURIComponent(authorize.request_id)}`, { headers });
-    if (!res.ok) return fail(`could not read the approval request (HTTP ${res.status})`);
-    const detail = await res.json();
-    const found = detail.tenant?.tenant_id ?? detail.tenant_id;
-    if (typeof found !== "string" || found.length === 0) return fail("approval request carries no tenant_id");
-    tenantId = found;
-  } catch (e) {
-    return fail(`could not read the approval request (${e.message})`);
-  }
-  const verifier = new HumanAuthVerifier({
-    audience: tenantId,
-    issuer: cfg.issuer ?? cfg.platformUrl,
-    ...deps.jwks ? { jwks: deps.jwks } : { jwksUri: `${cfg.platformUrl}/.well-known/jwks.json` },
-    replayStore: new FileReplayStore(cfg.dataDir)
-  });
   let verified;
   let receiptJws = "";
+  let tenantId;
   try {
     const now = deps.now ?? (() => Date.now());
     const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     const deadline = now() + cfg.ttlSeconds * 1e3 + 15e3;
     let interval = deps.pollIntervalMs ?? 2e3;
     const url = `${cfg.platformUrl}/v1/requests/${encodeURIComponent(authorize.request_id)}`;
+    let lastError = null;
+    let consecutiveFailures = 0;
+    let lastStatus;
     for (; ; ) {
-      const res = await deps.fetch(url, { headers });
-      if (!res.ok) throw new RequestPollError(`GET /v1/requests/${authorize.request_id} \u2192 HTTP ${res.status}`);
-      const body = await res.json();
-      rejected = readRespondAttempts(body.respond_attempts) ?? rejected;
-      if (body.status === "expired") throw new ApprovalExpiredError(`request ${authorize.request_id} expired`);
-      if (body.status === "decided") {
-        if (body.result === "denied") throw new ApprovalDeniedError(`request ${authorize.request_id} was denied`);
-        if (typeof body.receipt_jws === "string" && body.receipt_jws.length > 0) {
-          receiptJws = body.receipt_jws;
-          break;
+      let body = null;
+      try {
+        const res = await deps.fetch(url, { headers });
+        if (res.ok) {
+          body = await res.json();
+        } else if (retryablePoll(res.status)) {
+          lastError = `HTTP ${res.status}`;
+        } else {
+          throw new RequestPollError(`GET /v1/requests/${authorize.request_id} \u2192 HTTP ${res.status}`);
         }
+      } catch (e) {
+        if (e instanceof RequestPollError) throw e;
+        lastError = e.message;
       }
-      if (now() >= deadline) throw new ApprovalTimeoutError(`request ${authorize.request_id} still ${body.status ?? "pending"}`);
+      if (body) {
+        consecutiveFailures = 0;
+        lastError = null;
+        if (!tenantId) {
+          const found = body.tenant?.tenant_id ?? body.tenant_id;
+          if (typeof found !== "string" || found.length === 0) return fail("approval request carries no tenant_id");
+          tenantId = found;
+        }
+        rejected = readRespondAttempts(body.respond_attempts) ?? rejected;
+        lastStatus = body.status;
+        if (body.status === "expired") throw new ApprovalExpiredError(`request ${authorize.request_id} expired`);
+        if (body.status === "decided") {
+          if (body.result === "denied") throw new ApprovalDeniedError(`request ${authorize.request_id} was denied`);
+          if (typeof body.receipt_jws === "string" && body.receipt_jws.length > 0) {
+            receiptJws = body.receipt_jws;
+            break;
+          }
+        }
+      } else {
+        consecutiveFailures++;
+      }
+      if (now() >= deadline) {
+        if (lastError !== null) {
+          throw new RequestPollError(`GET /v1/requests/${authorize.request_id} kept failing until the deadline (${consecutiveFailures} consecutive failures, last error: ${lastError})`);
+        }
+        throw new ApprovalTimeoutError(`request ${authorize.request_id} still ${lastStatus ?? "pending"}`);
+      }
       await sleep(Math.max(0, Math.min(interval, deadline - now())));
       interval = Math.min(Math.floor(interval * 1.5), 15e3);
     }
+    const verifier = new HumanAuthVerifier({
+      audience: tenantId,
+      issuer: cfg.issuer ?? cfg.platformUrl,
+      ...deps.jwks ? { jwks: deps.jwks } : { jwksUri: `${cfg.platformUrl}/.well-known/jwks.json` },
+      replayStore: new FileReplayStore(cfg.dataDir)
+    });
     verified = await verifier.requireReceipt(receiptJws, {
       action: policy.action,
       plan,

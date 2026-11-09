@@ -246,7 +246,9 @@ describe("P2 rendering", () => {
     expect(String(plan.command)).toContain("‮"); // the hash binds the real bytes
     expect(plan.command_has_control_chars).toBe(true);
     expect(caption(i, plan)).not.toContain("\u001b");
-    expect(caption(i, plan)).toContain("�");
+    // T2-4: the marker names the code point instead of a bare �.
+    expect(caption(i, plan)).toContain("⟨U+001B⟩");
+    expect(caption(i, plan)).toContain("⟨U+202E⟩");
   });
 });
 

@@ -31,11 +31,13 @@ describe("buildPlan", () => {
   });
 
   it("Write: binds path, byte length and content hash, and shows the whole content when it fits", () => {
-    const plan = buildPlan(base({ tool_name: "Write", tool_input: { file_path: "/r/.env", content: "SECRET=1\n" } }));
+    // (T2-1 changed the fixture: `SECRET=1` is now masked, see qa-2026-11-09.test.ts)
+    const plan = buildPlan(base({ tool_name: "Write", tool_input: { file_path: "/r/.env", content: "PORT=3000\n" } }));
     expect(plan.file_path).toBe("/r/.env");
-    expect(plan.bytes).toBe(9);
+    expect(plan.bytes).toBe(10);
     expect(plan.content_sha256).toMatch(/^sha256:/);
-    expect(plan.content).toBe("SECRET=1\n");
+    expect(plan.content).toBe("PORT=3000\n");
+    expect(plan.content_masked).toBeUndefined();
     expect(plan.content_preview).toBeUndefined();
   });
 
